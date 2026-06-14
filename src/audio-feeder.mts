@@ -44,6 +44,7 @@ export class AudioFeeder {
     private readonly source: string = "silence",
     private readonly onError?: (err: Error) => void,
     private readonly audioQuality: AudioQuality = "voice",
+    private readonly ffmpegPath = "ffmpeg",
   ) {}
 
   start = (): void => {
@@ -70,7 +71,7 @@ export class AudioFeeder {
     const inputArgs = this.#resolveInputArgs();
     const processingArgs = this.#resolveProcessingArgs();
 
-    const proc = spawn("ffmpeg", [
+    const proc = spawn(this.ffmpegPath, [
       "-hide_banner",
       "-loglevel", "error",
       "-nostdin",

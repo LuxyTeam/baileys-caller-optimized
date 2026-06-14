@@ -62,6 +62,8 @@ export type VoipSdkConfig = {
     onError?: (err: Error) => void;
     /** WASM worker count. Defaults to at most 4; lower values use less memory. */
     pthreadPoolSize?: number;
+    /** FFmpeg executable used for file/lavfi audio. Defaults to `"ffmpeg"`. */
+    ffmpegPath?: string;
 };
 /** Mirrors the WhatsApp WASM `CallState` enum. */
 export declare const CallState: {

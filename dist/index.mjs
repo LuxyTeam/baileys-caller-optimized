@@ -503,7 +503,7 @@ export class VoipClient {
         this.#feeder = new AudioFeeder(this.#captureSampleRate, this.#captureChannels, this.#captureFramesPerChunk, (chunk) => {
             if (this.#engine && this.#capturePtr)
                 this.#engine.sendAudioData(chunk, this.#capturePtr);
-        }, audioSource, (err) => this.#handleError(err), audioQuality);
+        }, audioSource, (err) => this.#handleError(err), audioQuality, this.#config.ffmpegPath);
         this.#feeder.start();
     };
     #handleAudioCaptureStop = () => {

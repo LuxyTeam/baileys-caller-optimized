@@ -550,6 +550,7 @@ export class VoipClient {
       audioSource,
       (err) => this.#handleError(err),
       audioQuality,
+      this.#config.ffmpegPath,
     );
     this.#feeder.start();
   };

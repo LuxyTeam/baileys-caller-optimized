@@ -19,6 +19,7 @@ export class AudioFeeder {
     source;
     onError;
     audioQuality;
+    ffmpegPath;
     #proc = null;
     #pending = Buffer.alloc(0);
     #queue = [];
@@ -38,7 +39,7 @@ export class AudioFeeder {
     chunksEmitted = 0;
     allocatedChunks = 0;
     reusedChunks = 0;
-    constructor(sampleRate, channels, framesPerChunk, onChunk, source = "silence", onError, audioQuality = "voice") {
+    constructor(sampleRate, channels, framesPerChunk, onChunk, source = "silence", onError, audioQuality = "voice", ffmpegPath = "ffmpeg") {
         this.sampleRate = sampleRate;
         this.channels = channels;
         this.framesPerChunk = framesPerChunk;
@@ -46,6 +47,7 @@ export class AudioFeeder {
         this.source = source;
         this.onError = onError;
         this.audioQuality = audioQuality;
+        this.ffmpegPath = ffmpegPath;
     }
     start = () => {
         if (!this.#stopped)
@@ -65,7 +67,7 @@ export class AudioFeeder {
         }
         const inputArgs = this.#resolveInputArgs();
         const processingArgs = this.#resolveProcessingArgs();
-        const proc = spawn("ffmpeg", [
+        const proc = spawn(this.ffmpegPath, [
             "-hide_banner",
             "-loglevel", "error",
             "-nostdin",

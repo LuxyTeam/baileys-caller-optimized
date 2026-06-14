@@ -154,6 +154,7 @@ npx tsx examples/call.mts ./auth 12345678901 ./hello.mp3
 | `authDir` | `string` | Baileys multi-file auth directory. Treat it as a credential. |
 | `socket` | `Baileys socket?` | Existing authenticated and connected socket. Reused without taking ownership. |
 | `pthreadPoolSize` | `number?` | WASM worker count. Defaults to at most 4. |
+| `ffmpegPath` | `string?` | FFmpeg executable path. Defaults to the global `"ffmpeg"` command. |
 | `onError` | `(err: Error) => void` | Errors that happen outside an active call. |
 
 Provide either `authDir` or `socket`. When both are present, `socket` is used.

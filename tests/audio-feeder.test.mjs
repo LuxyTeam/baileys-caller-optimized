@@ -22,6 +22,29 @@ test("reports an unavailable ffmpeg executable", async () => {
   }
 });
 
+test("uses an explicitly configured ffmpeg executable", async () => {
+  const error = await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("expected configured ffmpeg spawn error")), 2_000);
+    const feeder = new AudioFeeder(
+      16_000,
+      1,
+      320,
+      () => {},
+      "lavfi:sine=440",
+      (err) => {
+        clearTimeout(timeout);
+        feeder.stop();
+        resolve(err);
+      },
+      "voice",
+      "definitely-missing-ffmpeg",
+    );
+    feeder.start();
+  });
+
+  assert.match(error.message, /definitely-missing-ffmpeg|ENOENT/i);
+});
+
 test("generates silence without spawning ffmpeg", async () => {
   const previousPath = process.env.PATH;
   process.env.PATH = "";
