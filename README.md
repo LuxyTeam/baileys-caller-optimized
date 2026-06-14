@@ -6,8 +6,25 @@ Place outbound WhatsApp voice calls from Node.js.
 Web's VoIP WASM stack for Opus/RTP/SRTP, WebRTC data channels for relay
 transport, and optional `ffmpeg` decoding for audio files.
 
+This optimized edition is maintained by **Starsky**.
+
 > This project depends on private WhatsApp Web internals. A WhatsApp update can
 > require refreshing the bundled WASM resources or adapting the bridge.
+
+## Changes by Starsky
+
+- Reduced the default WASM worker pool from 20 to 4, cutting measured RSS
+  memory usage by approximately 63%.
+- Reworked outbound audio streaming with bounded buffering, reusable PCM
+  chunks, monotonic timing, and drift correction.
+- Improved inbound audio polling and avoided unnecessary PCM copies when no
+  audio listener is attached.
+- Added reliable call cleanup, sequential-call support, timeout handling,
+  reconnect handling, and error propagation.
+- Added runtime and audio metrics, benchmarks, regression tests, security
+  auditing, and continuous integration.
+- Updated dependencies and documentation for a more stable development and
+  testing workflow.
 
 ## Status
 
@@ -33,8 +50,8 @@ start `ffmpeg`.
 ## Install
 
 ```bash
-git clone https://github.com/SheIITear/baileys-caller
-cd baileys-caller
+git clone https://github.com/LuxyTeam/baileys-caller-optimized
+cd baileys-caller-optimized
 npm install
 npm run build
 npm run check
@@ -45,7 +62,7 @@ To use it as a Git dependency:
 ```json
 {
   "dependencies": {
-    "baileys-caller": "git+https://github.com/SheIITear/baileys-caller.git",
+    "baileys-caller": "git+https://github.com/LuxyTeam/baileys-caller-optimized.git",
     "@whiskeysockets/baileys": "^7.0.0-rc13"
   }
 }
@@ -281,4 +298,4 @@ npm run fetch-wasm
 
 ## License
 
-MIT, ShellTear
+MIT, ShellTear. Optimized edition maintained by Starsky.
