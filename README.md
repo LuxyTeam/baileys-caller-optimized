@@ -187,6 +187,7 @@ console.log(stats.audio?.underflowChunks);
 console.log(stats.audio?.allocatedChunks);
 console.log(stats.audio?.reusedChunks);
 console.log(stats.relay?.droppedPackets);
+console.log(stats.relay?.failedConnections);
 console.log(stats.wasm?.managedWorkers);
 console.log(stats.wasm?.wasmMemoryBytes);
 console.log(stats.wasm?.playbackFramesSkipped);
@@ -198,6 +199,8 @@ Interpretation:
 - `audio.underflowChunks`: should remain near zero for file sources.
 - `audio.reusedChunks`: should increase during streaming, confirming buffer reuse.
 - `relay.droppedPackets`: sustained increases indicate transport/network trouble.
+- `relay.failedConnections`: failed relay candidates are reported but do not end
+  the call while another candidate may still connect.
 - `wasm.managedWorkers`: should match the configured pthread pool.
 - `wasm.playbackFramesSkipped`: increases when no `audio` listener is attached,
   confirming that unnecessary PCM copies are being avoided.

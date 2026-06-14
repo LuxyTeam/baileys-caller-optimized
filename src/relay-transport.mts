@@ -94,6 +94,7 @@ export type RelayTransportStats = {
   receivedBytes: number;
   droppedPackets: number;
   openConnections: number;
+  failedConnections: number;
 };
 
 export type RelayTransportConfig = {
@@ -112,6 +113,7 @@ const createEmptyStats = (): RelayTransportStats => ({
   receivedBytes: 0,
   droppedPackets: 0,
   openConnections: 0,
+  failedConnections: 0,
 });
 
 const getRelayLookupId = (ip: string, port: number): string =>
@@ -360,10 +362,12 @@ export class RelayRtcTransport {
 
   getStats = (): RelayTransportStats => {
     let openConnections = 0;
+    let failedConnections = 0;
     for (const connection of this.#connections.values()) {
       if (connection.state === "open") openConnections += 1;
+      else if (connection.state === "failed") failedConnections += 1;
     }
-    return { ...this.#totals, openConnections };
+    return { ...this.#totals, openConnections, failedConnections };
   };
 
   closeAll = async (): Promise<void> => {

@@ -333,7 +333,9 @@ export class VoipClient {
     this.#relay = new RelayRtcTransport({
       onTransportMessage: (data, ip, port) => this.#engine?.handleOnTransportMessage(data, ip, port),
       onIceRtt: (rttMs, ip, port) => this.#engine?.updateIceRtt(rttMs, ip, port),
-      onError: (err) => this.#handleError(err),
+      // A relay list contains multiple candidates. One candidate failing must
+      // not end a call while another candidate may still carry media.
+      onError: (err) => this.#handleNonFatalError(err),
     });
 
     this.#engine = new WasmEngine({
@@ -569,5 +571,11 @@ export class VoipClient {
       return;
     }
     this.#config.onError?.(error);
+  };
+
+  #handleNonFatalError = (err: unknown): void => {
+    const error = err instanceof Error ? err : new Error(String(err));
+    if (this.#activeCall) this.#activeCall._emitError(error);
+    else this.#config.onError?.(error);
   };
 }

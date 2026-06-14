@@ -28,6 +28,7 @@ const createEmptyStats = () => ({
     receivedBytes: 0,
     droppedPackets: 0,
     openConnections: 0,
+    failedConnections: 0,
 });
 const getRelayLookupId = (ip, port) => getConnectionIdentifier(ip, port === TRUE_WEB_CLIENT_RELAY_PORT ? TRUE_WEB_CLIENT_RELAY_PORT : port);
 const getRtcConnectPort = (info) => info.ip === "157.240.24.133" ? FAUX_WEB_CLIENT_RELAY_PORT : info.port;
@@ -248,11 +249,14 @@ export class RelayRtcTransport {
     };
     getStats = () => {
         let openConnections = 0;
+        let failedConnections = 0;
         for (const connection of this.#connections.values()) {
             if (connection.state === "open")
                 openConnections += 1;
+            else if (connection.state === "failed")
+                failedConnections += 1;
         }
-        return { ...this.#totals, openConnections };
+        return { ...this.#totals, openConnections, failedConnections };
     };
     closeAll = async () => {
         for (const id of [...this.#connections.keys()])

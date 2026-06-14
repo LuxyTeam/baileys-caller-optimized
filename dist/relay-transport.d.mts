@@ -26,6 +26,7 @@ export type RelayTransportStats = {
     receivedBytes: number;
     droppedPackets: number;
     openConnections: number;
+    failedConnections: number;
 };
 export type RelayTransportConfig = {
     onTransportMessage: (data: Uint8Array, ip: string, port: number) => void;
