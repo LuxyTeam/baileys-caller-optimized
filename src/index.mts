@@ -18,7 +18,7 @@ import { WasmEngine } from "./wasm-engine.mjs";
 import { RelayRtcTransport, type RelayListUpdatePayload } from "./relay-transport.mjs";
 import { SignalingBridge } from "./signaling.mjs";
 import { AudioFeeder } from "./audio-feeder.mjs";
-import { CallState, type VoipSdkConfig } from "./types.mjs";
+import { CallState, type AudioConfig, type VoipSdkConfig } from "./types.mjs";
 
 export type { VoipSdkConfig, CallOptions, CallEvents, AudioConfig } from "./types.mjs";
 export { CallState } from "./types.mjs";
@@ -83,6 +83,7 @@ export class ActiveCall extends EventEmitter {
   readonly #endPromise: Promise<string>;
   #endTimer: NodeJS.Timeout | null = null;
   #ended = false;
+  #audioConfig: AudioConfig | null = null;
 
   /** @internal mirrors the source path for the audio feeder */
   _audioSource: string = "silence";
@@ -95,21 +96,24 @@ export class ActiveCall extends EventEmitter {
     super();
     this.#endPromise = new Promise((res) => { this.#endResolver = res; });
     if (durationMs > 0) {
-      this.#endTimer = setTimeout(() => this.end(), durationMs);
+      this.#endTimer = setTimeout(() => this.#requestEnd("timeout"), durationMs);
+      this.#endTimer.unref?.();
     }
   }
 
   get state(): CallState { return this.#state; }
+  get ended(): boolean { return this.#ended; }
+  get audioConfig(): AudioConfig | null { return this.#audioConfig; }
 
-  end = (): void => {
-    if (this.#ended) return;
-    this.#ended = true;
-    if (this.#endTimer) { clearTimeout(this.#endTimer); this.#endTimer = null; }
-    try { this.engine.endCall(0, true); } catch {}
-  };
+  end = (): void => { this.#requestEnd("hangup"); };
 
   mute = (muted: boolean): void => {
-    try { this.engine.setMute(muted); } catch {}
+    if (this.#ended) return;
+    try {
+      this.engine.setMute(muted);
+    } catch (err) {
+      this._emitError(err);
+    }
   };
 
   waitForEnd = (): Promise<string> => this.#endPromise;
@@ -128,12 +132,36 @@ export class ActiveCall extends EventEmitter {
   _emitAudio = (pcm: Float32Array): void => { this.emit("audio", pcm); };
 
   /** @internal */
+  _updateAudioConfig = (config: AudioConfig): void => {
+    this.#audioConfig = config;
+    this.emit("audioConfig", config);
+  };
+
+  /** @internal */
+  _emitError = (err: unknown): void => {
+    const error = err instanceof Error ? err : new Error(String(err));
+    if (this.listenerCount("error") > 0) this.emit("error", error);
+  };
+
+  /** @internal */
   _forceEnd = (reason: string): void => {
     if (this.#ended) return;
     this.#ended = true;
+    this.#state = CallState.Idle;
     if (this.#endTimer) { clearTimeout(this.#endTimer); this.#endTimer = null; }
     this.emit("ended", reason);
     this.#endResolver(reason);
+  };
+
+  #requestEnd = (reason: string): void => {
+    if (this.#ended) return;
+    try {
+      this.engine.endCall(0, true);
+    } catch (err) {
+      this._emitError(err);
+    } finally {
+      this._forceEnd(reason);
+    }
   };
 }
 
@@ -161,6 +189,16 @@ export class VoipClient {
 
   /** Connect to WhatsApp and bring up the WASM VoIP stack. */
   connect = async (): Promise<void> => {
+    if (this.#sock || this.#engine) throw new Error("Client is already connected.");
+    try {
+      await this.#connectInternal();
+    } catch (err) {
+      this.disconnect();
+      throw err;
+    }
+  };
+
+  #connectInternal = async (): Promise<void> => {
     this.#baileys = await loadBaileys();
     const { useMultiFileAuthState, default: makeWASocket, DisconnectReason } = this.#baileys;
     const makeSocket: (opts: any) => any =
@@ -190,24 +228,27 @@ export class VoipClient {
     await new Promise<void>((resolveOpen, rejectOpen) => {
       let opened = false;
       let retries = 0;
+      let retryTimer: NodeJS.Timeout | null = null;
       const maxRetries = 5;
 
+      const scheduleReconnect = (delayMs: number): void => {
+        if (opened || retryTimer || retries >= maxRetries) return;
+        retries += 1;
+        retryTimer = setTimeout(() => {
+          retryTimer = null;
+          connectSocket();
+        }, delayMs);
+      };
+
       const connectSocket = () => {
-        this.#sock = createSocket();
-        this.#sock.ev.on("creds.update", saveCreds);
+        if (opened) return;
+        try { this.#sock?.end?.(); } catch {}
+        const socket = createSocket();
+        this.#sock = socket;
+        socket.ev.on("creds.update", saveCreds);
 
-        process.removeAllListeners("uncaughtException");
-        process.on("uncaughtException", (err: any) => {
-          const code = err?.output?.statusCode ?? err?.data?.attrs?.code;
-          if ((code === 515 || code === "515") && !opened && retries < maxRetries) {
-            retries += 1;
-            setTimeout(connectSocket, 1500);
-          } else if (!opened) {
-            rejectOpen(err);
-          }
-        });
-
-        this.#sock.ev.on("connection.update", (update: any) => {
+        socket.ev.on("connection.update", (update: any) => {
+          if (this.#sock !== socket) return;
           if (update.qr) {
             void import("qrcode-terminal")
               .then((qrt) => (qrt.default ?? qrt).generate(update.qr, { small: true }))
@@ -218,19 +259,27 @@ export class VoipClient {
           }
           if (update.connection === "open") {
             opened = true;
-            process.removeAllListeners("uncaughtException");
+            if (retryTimer) {
+              clearTimeout(retryTimer);
+              retryTimer = null;
+            }
             resolveOpen();
             return;
           }
-          if (update.connection === "close" && !opened) {
+          if (update.connection === "close") {
+            const error = update.lastDisconnect?.error ?? new Error("WhatsApp socket closed");
+            if (opened) {
+              this.#handleError(error);
+              this.disconnect();
+              return;
+            }
             const statusCode = update.lastDisconnect?.error?.output?.statusCode;
             const shouldReconnect =
               statusCode === 515 || statusCode === DisconnectReason?.restartRequired;
             if (shouldReconnect && retries < maxRetries) {
-              retries += 1;
-              setTimeout(connectSocket, 1000);
+              scheduleReconnect(1000);
             } else {
-              rejectOpen(update.lastDisconnect?.error ?? new Error("socket closed before open"));
+              rejectOpen(error);
             }
           }
         });
@@ -239,15 +288,20 @@ export class VoipClient {
       connectSocket();
     });
 
-    this.#signaling = new SignalingBridge({ sock: this.#sock });
+    this.#signaling = new SignalingBridge({
+      sock: this.#sock,
+      onError: (err) => this.#handleError(err),
+    });
     await this.#signaling.init();
 
     this.#relay = new RelayRtcTransport({
       onTransportMessage: (data, ip, port) => this.#engine?.handleOnTransportMessage(data, ip, port),
       onIceRtt: (rttMs, ip, port) => this.#engine?.updateIceRtt(rttMs, ip, port),
+      onError: (err) => this.#handleError(err),
     });
 
     this.#engine = new WasmEngine({
+      options: { pthreadPoolSize: this.#config.pthreadPoolSize },
       callbacks: {
         onSignalingXmpp: (peerJid, callId, xmlPayload) =>
           this.#signaling!.sendSignaling(peerJid, callId, xmlPayload),
@@ -256,6 +310,8 @@ export class VoipClient {
         onAudioCaptureInit: (config) => this.#handleAudioCaptureInit(config),
         onAudioCaptureStart: () => this.#handleAudioCaptureStart(),
         onAudioCaptureStop: () => this.#handleAudioCaptureStop(),
+        onAudioPlaybackInit: (config) => this.#activeCall?._updateAudioConfig(config),
+        shouldEmitAudioPlaybackData: () => (this.#activeCall?.listenerCount("audio") ?? 0) > 0,
         onAudioPlaybackData: (audioData) => this.#activeCall?._emitAudio(audioData),
         cryptoHkdf: computeHkdf,
         hmacSha256: computeHmacSha256,
@@ -289,8 +345,12 @@ export class VoipClient {
     if (this.#activeCall) throw new Error("A call is already active.");
 
     const targetNumber = phoneNumber.replace(/\D/g, "");
+    if (!targetNumber) throw new Error("phoneNumber must contain at least one digit.");
     const targetPnJid = `${targetNumber}@s.whatsapp.net`;
     const durationMs = opts.durationMs ?? 120_000;
+    if (!Number.isFinite(durationMs) || durationMs < 0) {
+      throw new Error("durationMs must be a finite number greater than or equal to zero.");
+    }
     const audioSource = opts.audioSource ?? "silence";
 
     const peerLid = await this.#signaling.resolveLid(targetPnJid);
@@ -315,17 +375,27 @@ export class VoipClient {
     const call = new ActiveCall(callId, this.#engine, durationMs);
     call._audioSource = audioSource;
     this.#activeCall = call;
-
-    this.#engine.startCall({
-      peerJid: peerLid,
-      peerPn: targetPnJid,
-      peerList: deviceList,
-      callId,
-      isVideo: false,
-      isLidCall: true,
-      isFromDialer: false,
-      extraData: tcToken,
+    call.once("ended", () => {
+      if (this.#activeCall === call) this.#activeCall = null;
+      this.#handleAudioCaptureStop();
     });
+
+    try {
+      this.#engine.startCall({
+        peerJid: peerLid,
+        peerPn: targetPnJid,
+        peerList: deviceList,
+        callId,
+        isVideo: false,
+        isLidCall: true,
+        isFromDialer: false,
+        extraData: tcToken,
+      });
+    } catch (err) {
+      call._emitError(err);
+      call._forceEnd("error");
+      throw err;
+    }
 
     return call;
   };
@@ -334,7 +404,9 @@ export class VoipClient {
   disconnect = (): void => {
     this.#activeCall?._forceEnd("disconnect");
     this.#activeCall = null;
+    this.#handleAudioCaptureStop();
     this.#relay?.closeAll();
+    this.#signaling?.dispose();
     this.#engine?.destroy();
     this.#sock?.end?.();
     this.#engine = null;
@@ -342,6 +414,15 @@ export class VoipClient {
     this.#signaling = null;
     this.#sock = null;
   };
+
+  /** Runtime metrics useful for monitoring audio quality and resource usage. */
+  getStats = () => ({
+    connected: !!this.#engine && !!this.#sock,
+    activeCallId: this.#activeCall?.callId ?? null,
+    audio: this.#feeder?.getStats() ?? null,
+    relay: this.#relay?.getStats() ?? null,
+    wasm: this.#engine?.getRuntimeStats() ?? null,
+  });
 
   // ─── private ──────────────────────────────────────────────────────────────
 
@@ -372,11 +453,15 @@ export class VoipClient {
     this.#captureFramesPerChunk = config.framesPerChunk || 320;
     const chunkSamples = this.#captureFramesPerChunk * this.#captureChannels;
     this.#captureChunkBytes = chunkSamples * Float32Array.BYTES_PER_ELEMENT;
+    if (this.#capturePtr) {
+      try { this.#engine.free(this.#capturePtr); } catch {}
+    }
     this.#capturePtr = this.#engine.malloc(this.#captureChunkBytes);
   };
 
   #handleAudioCaptureStart = (): void => {
     if (!this.#engine || !this.#capturePtr) return;
+    this.#feeder?.stop();
     const audioSource = this.#activeCall?._audioSource ?? "silence";
     this.#feeder = new AudioFeeder(
       this.#captureSampleRate,
@@ -386,6 +471,7 @@ export class VoipClient {
         if (this.#engine && this.#capturePtr) this.#engine.sendAudioData(chunk, this.#capturePtr);
       },
       audioSource,
+      (err) => this.#handleError(err),
     );
     this.#feeder.start();
   };
@@ -397,5 +483,15 @@ export class VoipClient {
       try { this.#engine.free(this.#capturePtr); } catch {}
       this.#capturePtr = 0;
     }
+  };
+
+  #handleError = (err: unknown): void => {
+    const error = err instanceof Error ? err : new Error(String(err));
+    if (this.#activeCall) {
+      this.#activeCall._emitError(error);
+      this.#activeCall._forceEnd("error");
+      return;
+    }
+    this.#config.onError?.(error);
   };
 }

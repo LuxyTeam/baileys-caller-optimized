@@ -12,7 +12,7 @@
  */
 import { EventEmitter } from "node:events";
 import { WasmEngine } from "./wasm-engine.mjs";
-import { CallState, type VoipSdkConfig } from "./types.mjs";
+import { CallState, type AudioConfig, type VoipSdkConfig } from "./types.mjs";
 export type { VoipSdkConfig, CallOptions, CallEvents, AudioConfig } from "./types.mjs";
 export { CallState } from "./types.mjs";
 /** A live or recently-ended call. */
@@ -24,6 +24,8 @@ export declare class ActiveCall extends EventEmitter {
     _audioSource: string;
     constructor(callId: string, engine: WasmEngine, durationMs: number);
     get state(): CallState;
+    get ended(): boolean;
+    get audioConfig(): AudioConfig | null;
     end: () => void;
     mute: (muted: boolean) => void;
     waitForEnd: () => Promise<string>;
@@ -31,6 +33,10 @@ export declare class ActiveCall extends EventEmitter {
     _updateState: (state: number) => void;
     /** @internal */
     _emitAudio: (pcm: Float32Array) => void;
+    /** @internal */
+    _updateAudioConfig: (config: AudioConfig) => void;
+    /** @internal */
+    _emitError: (err: unknown) => void;
     /** @internal */
     _forceEnd: (reason: string) => void;
 }
@@ -47,4 +53,33 @@ export declare class VoipClient {
     }) => Promise<ActiveCall>;
     /** Tear down the WhatsApp socket and release resources. */
     disconnect: () => void;
+    /** Runtime metrics useful for monitoring audio quality and resource usage. */
+    getStats: () => {
+        connected: boolean;
+        activeCallId: string | null;
+        audio: {
+            queuedChunks: number;
+            targetQueuedChunks: number;
+            maxQueuedChunks: number;
+            bufferMs: number;
+            droppedChunks: number;
+            underflowChunks: number;
+            chunksEmitted: number;
+            bytesProduced: number;
+            allocatedChunks: number;
+            reusedChunks: number;
+        } | null;
+        relay: import("./relay-transport.mjs").RelayTransportStats | null;
+        wasm: {
+            pthreadPoolSize: number;
+            managedWorkers: number;
+            wasmMemoryBytes: number;
+            playbackSampleRate: number;
+            playbackChannels: number;
+            playbackFramesPerChunk: number;
+            playbackFramesPolled: number;
+            playbackFramesEmitted: number;
+            playbackFramesSkipped: number;
+        } | null;
+    };
 }

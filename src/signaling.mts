@@ -23,6 +23,7 @@ export type BaileysSocket = {
 
 export type SignalingBridgeConfig = {
   sock: BaileysSocket;
+  onError?: (err: Error) => void;
 };
 
 const S_WHATSAPP_NET = "@s.whatsapp.net";
@@ -70,8 +71,10 @@ const parseCountAttr = (value: unknown, fallback = 0): number => {
 
 export class SignalingBridge {
   readonly #sock: BaileysSocket;
+  readonly #onError?: (err: Error) => void;
   #baileys: any = null;
   #voip: any = null;
+  #originalKeysSet: ((data: any) => Promise<any>) | null = null;
 
   readonly #observedTcTokens = new Map<string, { token: Uint8Array; timestamp: string }>();
   readonly #pendingTcTokenWaiters = new Map<string, ((token: Uint8Array | undefined) => void)[]>();
@@ -86,6 +89,7 @@ export class SignalingBridge {
 
   constructor(config: SignalingBridgeConfig) {
     this.#sock = config.sock;
+    this.#onError = config.onError;
   }
 
   /** Hand the WASM engine in so we can dispatch ack callbacks back to it. */
@@ -98,6 +102,7 @@ export class SignalingBridge {
 
     // Hook auth-state writes so we observe TC tokens as they land.
     const originalKeysSet = this.#sock.authState.keys.set.bind(this.#sock.authState.keys);
+    this.#originalKeysSet = originalKeysSet;
     this.#sock.authState.keys.set = async (data: any) => {
       const result = await originalKeysSet(data);
       for (const [jid, entry] of Object.entries<any>(data?.tctoken ?? {})) {
@@ -112,19 +117,34 @@ export class SignalingBridge {
   sendSignaling = (peerJid: string, callId: string, xmlPayload: Uint8Array): void => {
     this.#outgoingSignalingQueue = this.#outgoingSignalingQueue
       .then(() => this.#doSendSignaling(peerJid, callId, xmlPayload))
-      .catch(() => {});
+      .catch(this.#reportError);
   };
 
   processIncomingCall = (node: any, voip: any, activeCallId: string): void => {
     this.#incomingSignalingQueue = this.#incomingSignalingQueue
       .then(() => this.#doProcessIncomingCall(node, voip, activeCallId))
-      .catch(() => {});
+      .catch(this.#reportError);
   };
 
   processIncomingReceipt = (node: any, voip: any, activeCallId: string): void => {
     this.#incomingSignalingQueue = this.#incomingSignalingQueue
       .then(() => this.#doProcessIncomingReceipt(node, voip, activeCallId))
-      .catch(() => {});
+      .catch(this.#reportError);
+  };
+
+  dispose = (): void => {
+    if (this.#originalKeysSet) {
+      this.#sock.authState.keys.set = this.#originalKeysSet;
+      this.#originalKeysSet = null;
+    }
+    this.#voip = null;
+    this.#observedTcTokens.clear();
+    this.#pendingTcTokenWaiters.clear();
+    this.#ensuredSignalSessions.clear();
+    this.#remoteDevicePeerByCallId.clear();
+    this.#remoteObfuscatedPeerByCallId.clear();
+    this.#remoteXmppRoutePeerByCallId.clear();
+    this.#incomingCallPeerById.clear();
   };
 
   requestTcToken = async (jid: string): Promise<Uint8Array | undefined> => {
@@ -670,5 +690,9 @@ export class SignalingBridge {
       }
     } catch {}
     return undefined;
+  };
+
+  #reportError = (err: unknown): void => {
+    this.#onError?.(err instanceof Error ? err : new Error(String(err)));
   };
 }

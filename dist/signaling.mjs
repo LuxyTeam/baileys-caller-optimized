@@ -45,8 +45,10 @@ const parseCountAttr = (value, fallback = 0) => {
 };
 export class SignalingBridge {
     #sock;
+    #onError;
     #baileys = null;
     #voip = null;
+    #originalKeysSet = null;
     #observedTcTokens = new Map();
     #pendingTcTokenWaiters = new Map();
     #ensuredSignalSessions = new Map();
@@ -58,6 +60,7 @@ export class SignalingBridge {
     #incomingSignalingQueue = Promise.resolve(undefined);
     constructor(config) {
         this.#sock = config.sock;
+        this.#onError = config.onError;
     }
     /** Hand the WASM engine in so we can dispatch ack callbacks back to it. */
     attachEngine = (voip) => {
@@ -67,6 +70,7 @@ export class SignalingBridge {
         this.#baileys = await loadBaileys();
         // Hook auth-state writes so we observe TC tokens as they land.
         const originalKeysSet = this.#sock.authState.keys.set.bind(this.#sock.authState.keys);
+        this.#originalKeysSet = originalKeysSet;
         this.#sock.authState.keys.set = async (data) => {
             const result = await originalKeysSet(data);
             for (const [jid, entry] of Object.entries(data?.tctoken ?? {})) {
@@ -80,17 +84,31 @@ export class SignalingBridge {
     sendSignaling = (peerJid, callId, xmlPayload) => {
         this.#outgoingSignalingQueue = this.#outgoingSignalingQueue
             .then(() => this.#doSendSignaling(peerJid, callId, xmlPayload))
-            .catch(() => { });
+            .catch(this.#reportError);
     };
     processIncomingCall = (node, voip, activeCallId) => {
         this.#incomingSignalingQueue = this.#incomingSignalingQueue
             .then(() => this.#doProcessIncomingCall(node, voip, activeCallId))
-            .catch(() => { });
+            .catch(this.#reportError);
     };
     processIncomingReceipt = (node, voip, activeCallId) => {
         this.#incomingSignalingQueue = this.#incomingSignalingQueue
             .then(() => this.#doProcessIncomingReceipt(node, voip, activeCallId))
-            .catch(() => { });
+            .catch(this.#reportError);
+    };
+    dispose = () => {
+        if (this.#originalKeysSet) {
+            this.#sock.authState.keys.set = this.#originalKeysSet;
+            this.#originalKeysSet = null;
+        }
+        this.#voip = null;
+        this.#observedTcTokens.clear();
+        this.#pendingTcTokenWaiters.clear();
+        this.#ensuredSignalSessions.clear();
+        this.#remoteDevicePeerByCallId.clear();
+        this.#remoteObfuscatedPeerByCallId.clear();
+        this.#remoteXmppRoutePeerByCallId.clear();
+        this.#incomingCallPeerById.clear();
     };
     requestTcToken = async (jid) => {
         const userJid = this.#toBareJid(jid);
@@ -598,5 +616,8 @@ export class SignalingBridge {
         }
         catch { }
         return undefined;
+    };
+    #reportError = (err) => {
+        this.#onError?.(err instanceof Error ? err : new Error(String(err)));
     };
 }

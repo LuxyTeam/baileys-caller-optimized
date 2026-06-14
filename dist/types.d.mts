@@ -23,7 +23,9 @@ export type CallOptions = {
 export type CallEvents = {
     ringing: () => void;
     connected: () => void;
-    /** 16 kHz mono Float32 PCM frame from the remote peer. */
+    /** Negotiated remote PCM format. */
+    audioConfig: (config: AudioConfig) => void;
+    /** Float32 PCM frame from the remote peer using the negotiated audio config. */
     audio: (pcm: Float32Array) => void;
     /** Reason: `"hangup"` | `"timeout"` | `"rejected"` | `"remote_end"` | `"disconnect"` | etc. */
     ended: (reason: string) => void;
@@ -33,6 +35,10 @@ export type CallEvents = {
 export type VoipSdkConfig = {
     /** Path to a Baileys multi-file auth state directory. */
     authDir: string;
+    /** Receives client-level errors that happen outside an active call. */
+    onError?: (err: Error) => void;
+    /** WASM worker count. Defaults to at most 4; lower values use less memory. */
+    pthreadPoolSize?: number;
 };
 /** Mirrors the WhatsApp WASM `CallState` enum. */
 export declare const CallState: {

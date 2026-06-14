@@ -17,6 +17,7 @@ export type WasmEngineCallbacks = {
     onAudioPlaybackStart?: () => void;
     onAudioPlaybackStop?: () => void;
     onAudioPlaybackData?: (audioData: Float32Array) => void;
+    shouldEmitAudioPlaybackData?: () => boolean;
     cryptoHkdf?: (key: Uint8Array, salt: Uint8Array | null, info: Uint8Array, length: number) => Uint8Array;
     hmacSha256?: (data: Uint8Array, key: Uint8Array) => Uint8Array;
 };
@@ -35,15 +36,28 @@ export type WasmEngineConfig = {
         maxParticipantsScreenShare?: number;
         maxGroupSizeLongRingtone?: number;
         logLevel?: number;
+        pthreadPoolSize?: number;
     };
 };
 export declare class WasmEngine {
     #private;
-    static registerGlobalCallbackListener: (callbackName: string, handler: (data: any) => void) => void;
+    static registerGlobalCallbackListener: (callbackName: string, handler: (data: any) => void) => (() => void);
     static notifyGlobalCallbackListeners: (callbackName: string, data: any) => void;
     constructor(config?: WasmEngineConfig);
     initialize: () => Promise<void>;
     isInitialized: () => boolean;
+    getRuntimeStats: () => {
+        pthreadPoolSize: number;
+        managedWorkers: number;
+        wasmMemoryBytes: number;
+        playbackSampleRate: number;
+        playbackChannels: number;
+        playbackFramesPerChunk: number;
+        playbackFramesPolled: number;
+        playbackFramesEmitted: number;
+        playbackFramesSkipped: number;
+    };
+    setAudioPlaybackConfig: (config: WasmAudioConfig) => void;
     destroy: () => void;
     initVoipStack: (selfJid: string, meUserJid: string, selfLid: string) => void;
     waitForVoipStackReady: () => Promise<void>;

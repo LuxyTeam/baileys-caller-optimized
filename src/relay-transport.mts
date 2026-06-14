@@ -99,6 +99,7 @@ export type RelayTransportStats = {
 export type RelayTransportConfig = {
   onTransportMessage: (data: Uint8Array, ip: string, port: number) => void;
   onIceRtt?: (rttMs: number, ip: string, port: number) => void;
+  onError?: (err: Error) => void;
 };
 
 const getConnectionIdentifier = (ip: string, port: number): string =>
@@ -304,7 +305,7 @@ export class RelayRtcTransport {
     this.#relayInfoById.clear();
     for (const [id, info] of nextInfoById) {
       this.#relayInfoById.set(id, info);
-      void this.#ensureConnection(info);
+      void this.#ensureConnection(info).catch(this.#reportError);
     }
   };
 
@@ -341,7 +342,7 @@ export class RelayRtcTransport {
       connection.packetBuffer = [];
       connection.bufferedBytes = 0;
       bufferPacket(connection, arrayBuffer);
-      void this.#restartIce(connection);
+      void this.#restartIce(connection).catch(this.#reportError);
       return packet.byteLength;
     }
 
@@ -353,7 +354,7 @@ export class RelayRtcTransport {
     }
 
     bufferPacket(connection, arrayBuffer);
-    void this.#ensureConnection(info);
+    void this.#ensureConnection(info).catch(this.#reportError);
     return packet.byteLength;
   };
 
@@ -678,5 +679,9 @@ export class RelayRtcTransport {
       (module) => (module.default ?? module) as any,
     );
     return this.#wrtcPromise;
+  };
+
+  #reportError = (err: unknown): void => {
+    this.config.onError?.(err instanceof Error ? err : new Error(String(err)));
   };
 }

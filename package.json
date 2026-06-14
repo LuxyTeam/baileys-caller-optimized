@@ -23,19 +23,24 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json && tsc -p tsconfig.worker.json",
+    "test": "npm run build && node --test tests/*.test.mjs",
+    "check": "npm test && npm audit --audit-level=high",
+    "benchmark": "npm run build && node scripts/benchmark-runtime.mjs",
+    "benchmark:audio": "npm run build && node scripts/benchmark-audio.mjs",
     "example": "tsx examples/call.mts",
-    "fetch-wasm": "node scripts/fetch-wasm-resources.mjs"
+    "fetch-wasm": "node scripts/fetch-wasm-resources.mjs",
+    "prepack": "npm run build"
   },
   "dependencies": {
     "@roamhq/wrtc": "^0.10.0",
     "qrcode-terminal": "^0.12.0"
   },
   "peerDependencies": {
-    "@whiskeysockets/baileys": "^7.0.0-rc11"
+    "@whiskeysockets/baileys": "^7.0.0-rc13"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
-    "tsx": "^4.21.0",
+    "tsx": "^4.22.4",
     "typescript": "^5.9.3"
   },
   "engines": {

@@ -30,6 +30,7 @@ export type RelayTransportStats = {
 export type RelayTransportConfig = {
     onTransportMessage: (data: Uint8Array, ip: string, port: number) => void;
     onIceRtt?: (rttMs: number, ip: string, port: number) => void;
+    onError?: (err: Error) => void;
 };
 export declare class RelayRtcTransport {
     #private;

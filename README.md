@@ -1,74 +1,88 @@
 # baileys-caller
 
-Place WhatsApp voice calls from Node.js.
+Place outbound WhatsApp voice calls from Node.js.
 
-Wraps WhatsApp Web's official VoIP WASM stack and uses [Baileys](https://github.com/WhiskeySockets/Baileys) for authentication and signaling. Audio (MP3, WAV, or `Float32Array`) is encoded with Opus and sent over the live RTP session.
+`baileys-caller` uses Baileys for authentication and signaling, WhatsApp
+Web's VoIP WASM stack for Opus/RTP/SRTP, WebRTC data channels for relay
+transport, and optional `ffmpeg` decoding for audio files.
 
-> **Author:** ShellTear
+> This project depends on private WhatsApp Web internals. A WhatsApp update can
+> require refreshing the bundled WASM resources or adapting the bridge.
 
 ## Status
 
-- ✅ Outbound 1:1 voice calls
-- ✅ Stream audio from MP3/WAV files
-- ✅ Receive remote audio as `Float32Array`
-- ✅ Mute / unmute / hang up
-- ❌ Group calls
-- ❌ Video
-- ❌ Inbound calls
+- Outbound 1:1 voice calls
+- MP3/WAV and `lavfi:` outbound audio sources
+- Remote PCM audio as `Float32Array`
+- Negotiated remote audio format through `audioConfig`
+- Mute, unmute, timeout, and hang up
+- Multiple sequential calls on one connected client
+- Runtime audio, relay, worker, and memory metrics
+- No group calls, video, or inbound call API
 
 ## Requirements
 
-- Node.js ≥ 20
-- `ffmpeg` on `PATH` (used to decode/resample audio sources)
-- A linked WhatsApp account (you'll scan a QR on first run)
+- Node.js 20 or newer
+- `@whiskeysockets/baileys` 7.0.0-rc13 or newer compatible release
+- A linked WhatsApp account
+- `ffmpeg` on `PATH` only when streaming an audio file or `lavfi:` source
+
+The default `"silence"` source is generated directly in Node.js and does not
+start `ffmpeg`.
 
 ## Install
-
-This package isn't published on npm. Pull it in directly from git:
 
 ```bash
 git clone https://github.com/SheIITear/baileys-caller
 cd baileys-caller
 npm install
 npm run build
+npm run check
 ```
 
-You can also depend on it from another project via a git URL in `package.json`:
+To use it as a Git dependency:
 
 ```json
 {
   "dependencies": {
     "baileys-caller": "git+https://github.com/SheIITear/baileys-caller.git",
-    "@whiskeysockets/baileys": "^7.0.0-rc11"
+    "@whiskeysockets/baileys": "^7.0.0-rc13"
   }
 }
 ```
-
-`@whiskeysockets/baileys` is a peer dependency — install it in your project alongside this one.
 
 ## Quick Start
 
 ```ts
 import { VoipClient } from "baileys-caller";
 
-const client = new VoipClient({ authDir: "./auth" });
+const client = new VoipClient({
+  authDir: "./auth",
+  pthreadPoolSize: 4,
+  onError: (err) => console.error("client error:", err),
+});
 
-await client.connect(); // first run prints a QR for WhatsApp > Linked Devices
+await client.connect();
 
 const call = await client.call("12345678901", {
   audioSource: "./hello.mp3",
+  durationMs: 30_000,
 });
 
-call.on("ringing",   () => console.log("ringing"));
+call.on("ringing", () => console.log("ringing"));
 call.on("connected", () => console.log("connected"));
-call.on("audio",     (pcm) => { /* 16 kHz mono Float32Array from the peer */ });
-call.on("ended",     (reason) => console.log("ended:", reason));
+call.on("audioConfig", (config) => console.log("remote PCM:", config));
+call.on("audio", (pcm) => {
+  // pcm uses call.audioConfig sample rate, channels, and frame size.
+});
+call.on("error", (err) => console.error("call error:", err));
+call.on("ended", (reason) => console.log("ended:", reason));
 
-await call.waitForEnd();
+console.log(await call.waitForEnd());
 client.disconnect();
 ```
 
-Run the bundled example from a clone:
+Run the bundled example:
 
 ```bash
 npx tsx examples/call.mts ./auth 12345678901 ./hello.mp3
@@ -78,71 +92,193 @@ npx tsx examples/call.mts ./auth 12345678901 ./hello.mp3
 
 ### `new VoipClient(options)`
 
-| Option    | Type     | Description                                |
-|-----------|----------|--------------------------------------------|
-| `authDir` | `string` | Baileys multi-file auth state directory    |
+| Option | Type | Description |
+| --- | --- | --- |
+| `authDir` | `string` | Baileys multi-file auth directory. Treat it as a credential. |
+| `pthreadPoolSize` | `number?` | WASM worker count. Defaults to at most 4. |
+| `onError` | `(err: Error) => void` | Errors that happen outside an active call. |
+
+Only one `VoipClient`/WASM engine can be active in a Node.js process at once.
 
 ### `client.connect(): Promise<void>`
 
-Connects to WhatsApp. On first run a QR code is printed; scan it from `WhatsApp > Settings > Linked Devices`. Subsequent runs reuse `authDir`.
+Connects Baileys and initializes the VoIP WASM runtime. The first connection
+prints a QR code for WhatsApp Linked Devices.
 
-### `client.call(phoneNumber, opts?): Promise<ActiveCall>`
+### `client.call(phoneNumber, options?): Promise<ActiveCall>`
 
-Places an outbound call. `phoneNumber` is digits only (e.g. `"12345678901"`).
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `audioSource` | `string` | `"silence"` | File path, `"silence"`, or a `lavfi:` expression. |
+| `durationMs` | `number` | `120000` | Automatic hang-up timeout. Use `0` to disable it. |
 
-| Option        | Type                  | Description                                              |
-|---------------|-----------------------|----------------------------------------------------------|
-| `audioSource` | `string \| "silence"` | Path to MP3/WAV, or `"silence"` for an empty stream      |
-| `durationMs`  | `number?`             | Auto-hangup after N ms                                   |
+Only one call can be active at a time. After it ends, the same connected client
+can place another call.
+
+### `client.getStats()`
+
+Returns current operational metrics:
+
+```ts
+const stats = client.getStats();
+
+console.log(stats.audio?.bufferMs);
+console.log(stats.audio?.underflowChunks);
+console.log(stats.audio?.allocatedChunks);
+console.log(stats.audio?.reusedChunks);
+console.log(stats.relay?.droppedPackets);
+console.log(stats.wasm?.managedWorkers);
+console.log(stats.wasm?.wasmMemoryBytes);
+console.log(stats.wasm?.playbackFramesSkipped);
+```
+
+Interpretation:
+
+- `audio.bufferMs`: target is normally around 80 ms and is capped near 200 ms.
+- `audio.underflowChunks`: should remain near zero for file sources.
+- `audio.reusedChunks`: should increase during streaming, confirming buffer reuse.
+- `relay.droppedPackets`: sustained increases indicate transport/network trouble.
+- `wasm.managedWorkers`: should match the configured pthread pool.
+- `wasm.playbackFramesSkipped`: increases when no `audio` listener is attached,
+  confirming that unnecessary PCM copies are being avoided.
 
 ### `client.disconnect(): void`
 
-Closes the WhatsApp socket and releases resources.
+Ends the active call, stops audio, closes relay connections and the WhatsApp
+socket, terminates workers, and releases the WASM runtime.
 
 ### `ActiveCall`
 
-Returned by `client.call()`. Extends `EventEmitter`.
+Events:
 
-#### Events
+| Event | Payload | Description |
+| --- | --- | --- |
+| `ringing` | none | The remote device is ringing. |
+| `connected` | none | The call became active. |
+| `audioConfig` | `AudioConfig` | Negotiated PCM sample rate, channels, and frame size. |
+| `audio` | `Float32Array` | Remote PCM frame using the negotiated format. |
+| `error` | `Error` | Fatal call-related error. |
+| `ended` | `string` | Final reason such as `hangup`, `timeout`, or `remote_end`. |
 
-| Event       | Payload         | When                                          |
-|-------------|-----------------|-----------------------------------------------|
-| `ringing`   | —               | Remote device is ringing                      |
-| `connected` | —               | Call answered, media flowing                  |
-| `audio`     | `Float32Array`  | 16 kHz mono PCM frame from the remote peer    |
-| `ended`     | `string`        | Call ended (`hangup`, `timeout`, `rejected`)  |
-| `error`     | `Error`         | Fatal error                                   |
+Methods and properties:
 
-#### Methods
+- `call.end()`
+- `call.mute(muted)`
+- `call.waitForEnd()`
+- `call.callId`
+- `call.state`
+- `call.ended`
+- `call.audioConfig`
 
-- `call.end(): void` — hang up
-- `call.mute(muted: boolean): void` — toggle outgoing mute
-- `call.waitForEnd(): Promise<string>` — resolves with end reason
+## Audio Pipeline
 
-#### Properties
+Outbound file audio:
 
-- `call.callId: string`
+1. `ffmpeg` decodes and resamples the source to the format requested by WASM.
+   Input is read at native real-time speed to avoid burst decoding.
+2. A bounded queue keeps roughly 80 ms ready and never grows beyond about
+   200 ms.
+3. Reusable `Float32Array` buffers reduce per-frame allocations and garbage
+   collection.
+4. A monotonic clock sends frames at the exact negotiated frame cadence.
+5. WASM encodes Opus and sends RTP/SRTP through the selected relay.
 
-## How it works
+Inbound audio:
 
-1. Baileys handles WhatsApp authentication, encryption, and signaling stanzas.
-2. The WhatsApp Web VoIP WASM stack runs in-process to negotiate the call, encode/decode Opus, and manage the RTP/SRTP session.
-3. A pthread pool of `worker_threads` mirrors the browser's Web Worker pool the WASM expects.
-4. Outbound audio is decoded with `ffmpeg`, resampled to 16 kHz mono, fed into the WASM, and delivered to the relay.
-5. Inbound audio is exposed as `Float32Array` chunks via the `audio` event.
+1. WASM decodes received Opus.
+2. Playback polling follows the negotiated sample rate and frame size.
+3. Drift correction prevents a fixed timer mismatch from accelerating or
+   starving audio.
+4. PCM is copied only when the application has an `audio` listener.
 
-## Auth state
+## Performance
 
-`authDir` stores Baileys session keys after the first QR scan. Treat it like a credential — anyone with that directory can act as your linked device.
+The default worker pool is 4 instead of WhatsApp Web's browser-oriented pool
+of 20. On the development machine used for this project:
 
-## WASM resources
+| Pool | Approximate RSS | Initialization |
+| ---: | ---: | ---: |
+| 20 workers | 430 MB | 1.18 s |
+| 4 workers | 160 MB | 0.79-0.96 s |
 
-The WASM binary and its loader (`whatsapp.wasm`, `loader.js`, `worker-modules.js`) live under `assets/wasm/`. To refresh them from a current WhatsApp Web session:
+That is approximately 63% less RSS memory. Actual results depend on Node.js,
+the OS, WASM resources, and active call behavior.
+
+Choose a worker count conservatively:
+
+```ts
+const client = new VoipClient({
+  authDir: "./auth",
+  pthreadPoolSize: 4,
+});
+```
+
+Or use an environment override:
+
+```bash
+CALL_WASM_PTHREAD_POOL_SIZE=4 node app.mjs
+```
+
+Use 4 as the normal starting point. Increase it only if real-call testing shows
+worker exhaustion or audio stalls. Very low values may prevent the VoIP stack
+from scheduling required native threads.
+
+Run the local runtime benchmark:
+
+```bash
+npm run benchmark
+npm run benchmark:audio
+```
+
+## Quality Checklist
+
+For real-call validation:
+
+1. Subscribe to `audioConfig` and play PCM using exactly that format.
+2. Watch `audio.underflowChunks` and `relay.droppedPackets`.
+3. Compare calls over stable Wi-Fi and wired connections.
+4. Test both `"silence"` and a WAV/MP3 source.
+5. Increase `pthreadPoolSize` only when metrics demonstrate a worker problem.
+6. Do not perform heavy synchronous work inside the `audio` listener.
+
+The SDK cannot guarantee a fixed percentage of perceptual quality improvement.
+Network loss, relay selection, WhatsApp codec decisions, and the playback
+device remain external factors.
+
+## Development
+
+```bash
+npm run build       # compile source and worker bootstrap
+npm test            # build and run regression tests
+npm run check       # tests plus security audit
+npm run benchmark   # initialize WASM and report runtime resource usage
+npm run benchmark:audio # measure outbound buffering, reuse, and frame cadence
+npm run fetch-wasm  # refresh resources from WhatsApp Web via Chrome CDP
+```
+
+CI runs tests and `npm audit --audit-level=high`.
+
+## WASM Resources
+
+Bundled resources live in `assets/wasm/`:
+
+- `whatsapp.wasm`
+- `worker-modules.js`
+- `loader.js`
+
+To refresh them, run Chrome with remote debugging, open WhatsApp Web, and run:
 
 ```bash
 npm run fetch-wasm
 ```
 
+## Security
+
+- Treat `authDir` as a credential.
+- Do not commit auth state, tokens, packet dumps, or `.env` files.
+- Keep Baileys and the WASM resources current.
+- Packet dumping can expose sensitive call metadata and payloads.
+
 ## License
 
-MIT © ShellTear
+MIT, ShellTear

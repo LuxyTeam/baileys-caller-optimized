@@ -14,11 +14,15 @@ import * as path from "node:path";
 import { randomFillSync } from "node:crypto";
 import { Worker } from "node:worker_threads";
 import { fileURLToPath } from "node:url";
+import { availableParallelism } from "node:os";
+import { performance } from "node:perf_hooks";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const CALL_WASM_AB_PROPS_JSON = process.env.CALL_WASM_AB_PROPS_JSON ?? "";
+const CALL_WASM_PTHREAD_POOL_SIZE = Number(process.env.CALL_WASM_PTHREAD_POOL_SIZE);
 const PTHREAD_POOL_SIZE = 20;
 const VOIP_READY_TIMEOUT_MS = 15_000;
+const WASM_INITIALIZE_TIMEOUT_MS = 30_000;
 const parseJsonObjectEnv = (raw) => {
     if (!raw)
         return {};
@@ -80,7 +84,9 @@ class NodeWorkerMessagePort {
         });
         if (typeof worker.on === "function") {
             worker.on("message", (data) => this.#handleMessage(data));
-            worker.on("error", () => { });
+            worker.on("error", (err) => {
+                process.stderr.write(`[WasmEngine worker] ${err.stack ?? err.message}\n`);
+            });
         }
         else if (typeof worker.addEventListener === "function") {
             worker.addEventListener("message", (ev) => this.#handleMessage(ev?.data ?? ev));
@@ -192,7 +198,7 @@ class NodeWorkerMessagePort {
 }
 export class WasmEngine {
     static #globalCallbackListeners = new Map();
-    static #globalCallbacksRegistered = false;
+    static #activeEngine = null;
     static registerGlobalCallbackListener = (callbackName, handler) => {
         const key = `callback:${callbackName}`;
         let set = _a.#globalCallbackListeners.get(key);
@@ -201,6 +207,11 @@ export class WasmEngine {
             _a.#globalCallbackListeners.set(key, set);
         }
         set.add(handler);
+        return () => {
+            set?.delete(handler);
+            if (set?.size === 0)
+                _a.#globalCallbackListeners.delete(key);
+        };
     };
     static notifyGlobalCallbackListeners = (callbackName, data) => {
         const set = _a.#globalCallbackListeners.get(`callback:${callbackName}`);
@@ -220,6 +231,7 @@ export class WasmEngine {
     #vmContext = null;
     #unusedWorkers = [];
     #runningWorkers = [];
+    #managedWorkers = new Set();
     #pthreads = {};
     #nextWorkerID = 1;
     #wasmModule = null;
@@ -229,12 +241,21 @@ export class WasmEngine {
     #audioPlaybackLoopInterval = null;
     #audioPlaybackBuffer = null;
     #isPlaybackActive = false;
+    #audioPlaybackNextTickMs = 0;
+    #audioPlaybackSampleRate = 16000;
+    #audioPlaybackChannels = 1;
+    #audioPlaybackFramesPerChunk = 320;
+    #audioPlaybackFramesPolled = 0;
+    #audioPlaybackFramesEmitted = 0;
+    #audioPlaybackFramesSkipped = 0;
     #voipStackInitialized = false;
     #voipStackInitPromise = null;
     #voipReadyResolver = null;
     #voipReadyPromise = null;
+    #globalCallbackDisposers = [];
     #workerModulesCode = "";
     #loaderCode = "";
+    #pthreadPoolSize;
     constructor(config = {}) {
         const basePath = config.resourcesPath
             ? (path.isAbsolute(config.resourcesPath) ? config.resourcesPath : path.resolve(process.cwd(), config.resourcesPath))
@@ -242,6 +263,10 @@ export class WasmEngine {
         const wasmPath = config.wasmPath
             ? (path.isAbsolute(config.wasmPath) ? config.wasmPath : path.resolve(process.cwd(), config.wasmPath))
             : path.join(basePath, "assets", "wasm", "whatsapp.wasm");
+        const requestedPoolSize = config.options?.pthreadPoolSize ??
+            (Number.isFinite(CALL_WASM_PTHREAD_POOL_SIZE) ? CALL_WASM_PTHREAD_POOL_SIZE : undefined) ??
+            Math.min(4, availableParallelism());
+        this.#pthreadPoolSize = Math.max(1, Math.min(PTHREAD_POOL_SIZE, Math.trunc(requestedPoolSize)));
         this.#config = {
             ...config,
             wasmPath,
@@ -259,6 +284,9 @@ export class WasmEngine {
     initialize = async () => {
         if (this.#initialized)
             throw new Error("WasmEngine already initialized");
+        if (_a.#activeEngine && _a.#activeEngine !== this) {
+            throw new Error("Only one WasmEngine instance can be active at a time.");
+        }
         const voipStorageDir = "/tmp/voip";
         try {
             if (!fs.existsSync(voipStorageDir))
@@ -274,13 +302,13 @@ export class WasmEngine {
             ? Buffer.from(this.#config.wasmBinary)
             : fs.readFileSync(this.#config.wasmPath);
         const diskWorkerCode = fs.existsSync(workerFile) ? fs.readFileSync(workerFile, "utf8") : "";
-        this.#workerModulesCode = this.#config.workerModulesCode ?? diskWorkerCode;
+        this.#workerModulesCode = this.#patchPthreadPoolSize(this.#config.workerModulesCode ?? diskWorkerCode);
         const workerBundleHasLoader = typeof this.#workerModulesCode === "string" && /WAWebVoipWebWasmLoader/.test(this.#workerModulesCode);
         // Skip the on-disk loader.js if the worker bundle already has a loader —
         // the standalone loader.js is older and would clobber the freshly fetched
         // bindings inside worker-modules.js.
-        this.#loaderCode = this.#config.loaderCode ??
-            (workerBundleHasLoader ? "" : fs.existsSync(loaderFile) ? fs.readFileSync(loaderFile, "utf8") : "");
+        this.#loaderCode = this.#patchPthreadPoolSize(this.#config.loaderCode ??
+            (workerBundleHasLoader ? "" : fs.existsSync(loaderFile) ? fs.readFileSync(loaderFile, "utf8") : ""));
         if (!this.#loaderCode && !this.#workerModulesCode) {
             throw new Error("No loader/worker code available to initialize VoIP");
         }
@@ -315,21 +343,52 @@ export class WasmEngine {
         if (typeof wasmLoader !== "function") {
             throw new Error(`No compatible WASM loader found. Tried: ${loaderModuleNames.join(", ")}`);
         }
-        if (!_a.#globalCallbacksRegistered)
+        let timeout = null;
+        try {
+            _a.#activeEngine = this;
             this.#registerGlobalCallbacks();
-        await this.#initPThreadPool();
-        const workersLoadingPromise = this.#loadWasmModuleToAllWorkers();
-        const readyPromise = wasmLoader({
-            wasmBinary: wasmBuffer,
-            wasmMemory: memory,
-            locateFile: () => this.#config.wasmPath,
-            onRuntimeInitialized: () => { },
-        });
-        const [instance] = await Promise.all([readyPromise, workersLoadingPromise]);
-        this.#instance = instance;
-        this.#initialized = true;
+            const readyPromise = wasmLoader({
+                wasmBinary: wasmBuffer,
+                wasmMemory: memory,
+                pthreadPoolSizeOverride: this.#pthreadPoolSize,
+                locateFile: () => this.#config.wasmPath,
+                onRuntimeInitialized: () => { },
+            });
+            const [instance] = await Promise.race([
+                Promise.all([readyPromise]),
+                new Promise((_, reject) => {
+                    timeout = setTimeout(() => reject(new Error(`WASM engine initialization timed out after ${WASM_INITIALIZE_TIMEOUT_MS}ms`)), WASM_INITIALIZE_TIMEOUT_MS);
+                }),
+            ]);
+            this.#instance = instance;
+            this.#initialized = true;
+        }
+        catch (err) {
+            this.destroy();
+            throw err;
+        }
+        finally {
+            if (timeout)
+                clearTimeout(timeout);
+        }
     };
     isInitialized = () => this.#initialized;
+    getRuntimeStats = () => ({
+        pthreadPoolSize: this.#pthreadPoolSize,
+        managedWorkers: this.#managedWorkers.size,
+        wasmMemoryBytes: this.#wasmMemory?.buffer.byteLength ?? 0,
+        playbackSampleRate: this.#audioPlaybackSampleRate,
+        playbackChannels: this.#audioPlaybackChannels,
+        playbackFramesPerChunk: this.#audioPlaybackFramesPerChunk,
+        playbackFramesPolled: this.#audioPlaybackFramesPolled,
+        playbackFramesEmitted: this.#audioPlaybackFramesEmitted,
+        playbackFramesSkipped: this.#audioPlaybackFramesSkipped,
+    });
+    setAudioPlaybackConfig = (config) => {
+        this.#audioPlaybackSampleRate = config.sampleRate || 16000;
+        this.#audioPlaybackChannels = config.channels || 1;
+        this.#audioPlaybackFramesPerChunk = config.framesPerChunk || 320;
+    };
     destroy = () => {
         this.#stopAudioPlaybackLoop();
         if (this.#instance && typeof this.#instance.endCall === "function") {
@@ -344,6 +403,13 @@ export class WasmEngine {
             }
             catch { }
         }
+        for (const worker of this.#managedWorkers) {
+            try {
+                void worker.terminate();
+            }
+            catch { }
+        }
+        this.#managedWorkers.clear();
         this.#runningWorkers = [];
         this.#unusedWorkers = [];
         this.#instance = null;
@@ -351,21 +417,28 @@ export class WasmEngine {
         this.#moduleRegistry.clear();
         this.#wasmModule = null;
         this.#wasmMemory = null;
+        this.#voipStackInitialized = false;
+        this.#voipStackInitPromise = null;
+        this.#voipReadyResolver = null;
+        this.#voipReadyPromise = null;
+        for (const dispose of this.#globalCallbackDisposers.splice(0))
+            dispose();
+        if (_a.#activeEngine === this)
+            _a.#activeEngine = null;
         this.#initialized = false;
     };
     initVoipStack = (selfJid, meUserJid, selfLid) => {
         this.#ensureInitialized();
         if (this.#voipStackInitialized || this.#voipStackInitPromise)
             return;
-        this.#voipStackInitPromise = new Promise((resolveInit) => {
-            this.#voipReadyPromise = new Promise((readyResolve) => {
-                this.#voipReadyResolver = () => {
-                    this.#voipStackInitialized = true;
-                    this.#voipReadyResolver = null;
-                    this.#voipReadyPromise = null;
-                    readyResolve();
-                };
-            });
+        this.#voipReadyPromise = new Promise((readyResolve) => {
+            this.#voipReadyResolver = () => {
+                this.#voipStackInitialized = true;
+                this.#voipReadyResolver = null;
+                readyResolve();
+            };
+        });
+        this.#voipStackInitPromise = (async () => {
             try {
                 this.#applyDefaultAbProps();
                 try {
@@ -381,23 +454,25 @@ export class WasmEngine {
                         throw modernErr;
                     }
                 }
-                Promise.race([
-                    this.#voipReadyPromise,
-                    new Promise((r) => setTimeout(() => {
+                await new Promise((resolveReady, rejectReady) => {
+                    const timeout = setTimeout(() => {
                         this.#voipStackInitialized = true;
-                        r();
-                    }, VOIP_READY_TIMEOUT_MS)),
-                ]).finally(() => {
-                    this.#voipStackInitPromise = null;
-                    resolveInit();
+                        this.#config.callbacks?.onLog?.("warn", `VoIP ready callback was not received within ${VOIP_READY_TIMEOUT_MS}ms; continuing`);
+                        resolveReady();
+                    }, VOIP_READY_TIMEOUT_MS);
+                    this.#voipReadyPromise.then(() => {
+                        clearTimeout(timeout);
+                        resolveReady();
+                    }, rejectReady);
                 });
             }
-            catch {
+            catch (err) {
                 this.#voipReadyResolver = null;
-                this.#voipReadyPromise = null;
-                this.#voipStackInitPromise = null;
-                resolveInit();
+                throw err;
             }
+        })().finally(() => {
+            this.#voipStackInitPromise = null;
+            this.#voipReadyPromise = null;
         });
     };
     waitForVoipStackReady = async () => {
@@ -570,8 +645,8 @@ export class WasmEngine {
         this.#isPlaybackActive = true;
         if (typeof this.#instance.requestAudioDataFromWasmVoip !== "function")
             return;
-        const framesPerChunk = 320;
-        const bufferSize = framesPerChunk * 4;
+        const samplesPerChunk = this.#audioPlaybackFramesPerChunk * this.#audioPlaybackChannels;
+        const bufferSize = samplesPerChunk * Float32Array.BYTES_PER_ELEMENT;
         try {
             const _malloc = this.#instance._malloc ?? this.#instance.malloc;
             if (!_malloc)
@@ -583,7 +658,8 @@ export class WasmEngine {
         }
         if (!this.#audioPlaybackBuffer || this.#audioPlaybackBuffer <= 0)
             return;
-        this.#audioPlaybackLoopInterval = setInterval(() => {
+        const intervalMs = (this.#audioPlaybackFramesPerChunk / this.#audioPlaybackSampleRate) * 1000;
+        const tick = () => {
             if (!this.#isPlaybackActive || !this.#instance || !this.#initialized) {
                 this.#stopAudioPlaybackLoop();
                 return;
@@ -597,16 +673,31 @@ export class WasmEngine {
                 const numFloats = Math.floor(bufferSize / 4);
                 if (index < 0 || index + numFloats > heapF32.length)
                     return;
+                this.#audioPlaybackFramesPolled += 1;
+                if (this.#config.callbacks?.shouldEmitAudioPlaybackData?.() === false) {
+                    this.#audioPlaybackFramesSkipped += 1;
+                    return;
+                }
                 const audioData = new Float32Array(heapF32.buffer, heapF32.byteOffset + index * 4, numFloats);
-                const hasNonZero = audioData.some((s) => Math.abs(s) > 0.0001);
-                if (hasNonZero)
-                    this.#config.callbacks?.onAudioPlaybackData?.(audioData);
+                this.#config.callbacks?.onAudioPlaybackData?.(audioData.slice());
+                this.#audioPlaybackFramesEmitted += 1;
             }
             catch { }
-        }, 16);
+            const now = performance.now();
+            this.#audioPlaybackNextTickMs += intervalMs;
+            if (now - this.#audioPlaybackNextTickMs > intervalMs) {
+                this.#audioPlaybackNextTickMs = now + intervalMs;
+            }
+            this.#audioPlaybackLoopInterval = setTimeout(tick, Math.max(0, this.#audioPlaybackNextTickMs - now));
+            this.#audioPlaybackLoopInterval.unref?.();
+        };
+        this.#audioPlaybackNextTickMs = performance.now();
+        this.#audioPlaybackLoopInterval = setTimeout(tick, 0);
+        this.#audioPlaybackLoopInterval.unref?.();
     };
     #stopAudioPlaybackLoop = () => {
         this.#isPlaybackActive = false;
+        this.#audioPlaybackNextTickMs = 0;
         if (this.#audioPlaybackLoopInterval) {
             clearInterval(this.#audioPlaybackLoopInterval);
             this.#audioPlaybackLoopInterval = null;
@@ -699,7 +790,7 @@ export class WasmEngine {
             return;
         try {
             const worker = new Worker(workerScriptPath, {
-                stdout: true, stderr: true,
+                stdout: true, stderr: true, execArgv: [],
                 workerData: {
                     wasmPath: this.#config.wasmPath,
                     wasmBinary: this.#config.wasmBinary,
@@ -710,6 +801,8 @@ export class WasmEngine {
                     enableLogs: this.#config.enableLogs,
                 },
             });
+            this.#managedWorkers.add(worker);
+            worker.once("exit", () => this.#managedWorkers.delete(worker));
             const port = new NodeWorkerMessagePort(worker, "WAWebVoipWebWasmWorker");
             worker.stdout?.on("data", () => { }); // suppress noisy worker stdout
             worker.stderr?.on("data", filterWorkerStderr);
@@ -748,7 +841,10 @@ export class WasmEngine {
     };
     #registerGlobalCallbacks = () => {
         const callbacks = this.#config.callbacks ?? {};
-        _a.registerGlobalCallbackListener("loggingCallback", (data) => {
+        const register = (name, handler) => {
+            this.#globalCallbackDisposers.push(_a.registerGlobalCallbackListener(name, handler));
+        };
+        register("loggingCallback", (data) => {
             if (!this.#config.enableLogs)
                 return;
             const level = data?.level;
@@ -757,7 +853,7 @@ export class WasmEngine {
             callbacks.onLog?.(mapped, msg);
         });
         if (callbacks.onAudioCaptureInit) {
-            _a.registerGlobalCallbackListener("initCaptureDriverJS", (data) => {
+            register("initCaptureDriverJS", (data) => {
                 callbacks.onAudioCaptureInit({
                     sampleRate: data?.sample_rate ?? data?.sampleRate,
                     channels: data?.channels,
@@ -766,28 +862,30 @@ export class WasmEngine {
                 });
             });
         }
-        _a.registerGlobalCallbackListener("startCaptureJS", () => callbacks.onAudioCaptureStart?.());
-        _a.registerGlobalCallbackListener("stopCaptureJS", () => callbacks.onAudioCaptureStop?.());
+        register("startCaptureJS", () => callbacks.onAudioCaptureStart?.());
+        register("stopCaptureJS", () => callbacks.onAudioCaptureStop?.());
         if (callbacks.onAudioPlaybackInit) {
-            _a.registerGlobalCallbackListener("initPlaybackDriverJS", (data) => {
-                callbacks.onAudioPlaybackInit({
+            register("initPlaybackDriverJS", (data) => {
+                const config = {
                     sampleRate: data?.sample_rate ?? data?.sampleRate,
                     channels: data?.channels,
                     bitsPerSample: data?.bits_per_sample ?? data?.bitsPerSample,
                     framesPerChunk: data?.frames_per_chunk ?? data?.framesPerChunk,
-                });
+                };
+                this.setAudioPlaybackConfig(config);
+                callbacks.onAudioPlaybackInit(config);
             });
         }
-        _a.registerGlobalCallbackListener("startPlaybackJS", () => {
+        register("startPlaybackJS", () => {
             callbacks.onAudioPlaybackStart?.();
             this.#startAudioPlaybackLoop();
         });
-        _a.registerGlobalCallbackListener("stopPlaybackJS", () => {
+        register("stopPlaybackJS", () => {
             this.#stopAudioPlaybackLoop();
             callbacks.onAudioPlaybackStop?.();
         });
         if (callbacks.onSignalingXmpp) {
-            _a.registerGlobalCallbackListener("onSignalingXmpp", (data) => {
+            register("onSignalingXmpp", (data) => {
                 const peerJid = data.peerJid ?? data.args?.peerJid;
                 const callId = data.callId ?? data.args?.callId;
                 let xmlPayload = data.xmlPayload ?? data.args?.xmlPayload;
@@ -801,12 +899,12 @@ export class WasmEngine {
             });
         }
         if (callbacks.onCallEvent) {
-            _a.registerGlobalCallbackListener("onCallEvent", (data) => {
+            register("onCallEvent", (data) => {
                 callbacks.onCallEvent(data.eventType, data.eventDataJson);
             });
         }
         if (callbacks.sendDataToRelay) {
-            _a.registerGlobalCallbackListener("sendDataToRelay", (data) => {
+            register("sendDataToRelay", (data) => {
                 let relayData = data.data ?? data.args?.data;
                 const ip = data.ip ?? data.args?.ip;
                 const portNum = data.port ?? data.args?.port;
@@ -828,7 +926,11 @@ export class WasmEngine {
                 return relayData.byteLength;
             });
         }
-        _a.#globalCallbacksRegistered = true;
+    };
+    #patchPthreadPoolSize = (code) => {
+        if (!code || this.#pthreadPoolSize === PTHREAD_POOL_SIZE)
+            return code;
+        return code.replace(/for\(var e=20;e--;\)en\.allocateUnusedWorker\(\)/g, `for(var e=${this.#pthreadPoolSize};e--;)en.allocateUnusedWorker()`);
     };
     #requireModule = (name) => {
         const preDefinedModules = {
@@ -843,7 +945,7 @@ export class WasmEngine {
                         ? resource.resourcePath
                         : resolveWorkerScriptPath();
                     const worker = new Worker(scriptPath, {
-                        stdout: true, stderr: true,
+                        stdout: true, stderr: true, execArgv: [],
                         workerData: {
                             wasmPath: this.#config.wasmPath,
                             wasmBinary: this.#config.wasmBinary,
@@ -854,6 +956,8 @@ export class WasmEngine {
                             enableLogs: this.#config.enableLogs,
                         },
                     });
+                    this.#managedWorkers.add(worker);
+                    worker.once("exit", () => this.#managedWorkers.delete(worker));
                     worker.stdout?.on("data", () => { });
                     worker.stderr?.on("data", filterWorkerStderr);
                     return worker;
@@ -974,10 +1078,12 @@ export class WasmEngine {
             startCaptureJS: () => { callbacks.onAudioCaptureStart?.(); return 0; },
             stopCaptureJS: () => { callbacks.onAudioCaptureStop?.(); return 0; },
             initPlaybackDriverJS: (data) => {
-                callbacks.onAudioPlaybackInit?.({
+                const config = {
                     sampleRate: data?.sample_rate, channels: data?.channels,
                     bitsPerSample: data?.bits_per_sample, framesPerChunk: data?.frames_per_chunk,
-                });
+                };
+                this.setAudioPlaybackConfig(config);
+                callbacks.onAudioPlaybackInit?.(config);
                 return 0;
             },
             startPlaybackJS: () => {

@@ -7,23 +7,33 @@
  * @author ShellTear
  */
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { performance } from "node:perf_hooks";
 
-const LOW_WATERMARK_CHUNKS = 16;
-const MAX_QUEUED_CHUNKS = 1024;
-const DEFAULT_WARMUP_MS = 500;
+const TARGET_BUFFER_MS = 80;
+const MAX_BUFFER_MS = 200;
+const DEFAULT_WARMUP_MS = 250;
 
 export class AudioFeeder {
   #proc: ChildProcessWithoutNullStreams | null = null;
-  #pending = Buffer.alloc(0);
+  #pending: Buffer<ArrayBufferLike> = Buffer.alloc(0);
   #queue: Float32Array[] = [];
+  #reusableChunks: Float32Array[] = [];
+  #silenceChunk: Float32Array | null = null;
   #emitTimer: NodeJS.Timeout | null = null;
   #nextEmitAtMs = 0;
   #warmupUntilMs = 0;
+  #stopped = true;
+  #chunkIntervalMs = 20;
+  #targetQueuedChunks = 4;
+  #maxQueuedChunks = 10;
+  #isSilenceSource = false;
 
   droppedChunks = 0;
   underflowChunks = 0;
   bytesProduced = 0;
   chunksEmitted = 0;
+  allocatedChunks = 0;
+  reusedChunks = 0;
 
   constructor(
     private readonly sampleRate: number,
@@ -31,111 +41,176 @@ export class AudioFeeder {
     private readonly framesPerChunk: number,
     private readonly onChunk: (chunk: Float32Array) => void,
     private readonly source: string = "silence",
+    private readonly onError?: (err: Error) => void,
   ) {}
 
   start = (): void => {
-    if (this.#proc) return;
+    if (!this.#stopped) return;
+    this.#stopped = false;
 
     const chunkSamples = this.framesPerChunk * this.channels;
     const chunkBytes = chunkSamples * Float32Array.BYTES_PER_ELEMENT;
-    const chunkIntervalMs = (this.framesPerChunk / this.sampleRate) * 1000;
+    this.#chunkIntervalMs = (this.framesPerChunk / this.sampleRate) * 1000;
+    this.#targetQueuedChunks = Math.max(2, Math.ceil(TARGET_BUFFER_MS / this.#chunkIntervalMs));
+    this.#maxQueuedChunks = Math.max(
+      this.#targetQueuedChunks + 1,
+      Math.ceil(MAX_BUFFER_MS / this.#chunkIntervalMs),
+    );
+    this.#nextEmitAtMs = 0;
+
+    this.#isSilenceSource = !this.source || this.source === "silence";
+    if (this.#isSilenceSource) {
+      this.#warmupUntilMs = 0;
+      this.#scheduleNext(chunkSamples);
+      return;
+    }
 
     const inputArgs = this.#resolveInputArgs();
 
-    this.#proc = spawn("ffmpeg", [
+    const proc = spawn("ffmpeg", [
       "-hide_banner",
       "-loglevel", "error",
-      "-thread_queue_size", "512",
+      "-nostdin",
+      "-threads", "1",
+      "-thread_queue_size", "64",
+      "-re",
       ...inputArgs,
       "-f", "f32le",
       "-ac", String(this.channels),
       "-ar", String(this.sampleRate),
       "pipe:1",
     ]);
+    this.#proc = proc;
 
-    this.#proc.stdout.on("data", (chunk: Buffer) => {
-      this.#pending = Buffer.concat([this.#pending, chunk]);
+    proc.stdout.on("data", (chunk: Buffer) => {
+      this.#pending = this.#pending.length === 0 ? chunk : Buffer.concat([this.#pending, chunk]);
       while (this.#pending.length >= chunkBytes) {
-        if (this.#queue.length >= MAX_QUEUED_CHUNKS) {
-          this.#proc?.stdout.pause();
+        if (this.#queue.length >= this.#maxQueuedChunks) {
+          proc.stdout.pause();
           break;
         }
         const frame = this.#pending.subarray(0, chunkBytes);
         this.#pending = this.#pending.subarray(chunkBytes);
-        const out = new Float32Array(chunkSamples);
+        const reusable = this.#reusableChunks.pop();
+        const out = reusable ?? new Float32Array(chunkSamples);
+        if (reusable) this.reusedChunks += 1;
+        else this.allocatedChunks += 1;
         out.set(new Float32Array(frame.buffer, frame.byteOffset, chunkSamples));
         this.bytesProduced += chunkBytes;
         this.#queue.push(out);
       }
+      if (this.#pending.length === 0) this.#pending = Buffer.alloc(0);
     });
 
-    this.#proc.stderr.on("data", (chunk: Buffer) => {
+    proc.stderr.on("data", (chunk: Buffer) => {
       process.stderr.write(`[AudioFeeder] ${chunk.toString().trim()}\n`);
     });
 
-    this.#proc.on("exit", (code) => {
-      if (code !== 0 && code !== null) {
-        process.stderr.write(`[AudioFeeder] ffmpeg exited with code=${code}\n`);
-      }
-      this.#proc = null;
+    proc.on("error", (err) => {
+      if (this.#proc === proc) this.#proc = null;
+      if (!this.#stopped) this.onError?.(err);
     });
 
-    this.#nextEmitAtMs = 0;
-    this.#warmupUntilMs = Date.now() + DEFAULT_WARMUP_MS;
-    this.#scheduleNext(chunkSamples, chunkIntervalMs);
+    proc.on("exit", (code) => {
+      if (code !== 0 && code !== null) {
+        const err = new Error(`ffmpeg exited with code=${code}`);
+        process.stderr.write(`[AudioFeeder] ${err.message}\n`);
+        if (!this.#stopped) this.onError?.(err);
+      }
+      if (this.#proc === proc) this.#proc = null;
+    });
+
+    this.#warmupUntilMs = performance.now() + DEFAULT_WARMUP_MS;
+    this.#scheduleNext(chunkSamples);
   };
 
   stop = (): void => {
-    if (this.#emitTimer) {
-      clearTimeout(this.#emitTimer);
-      this.#emitTimer = null;
-    }
+    this.#stopped = true;
+    this.#stopTimer();
     this.#proc?.kill("SIGTERM");
     this.#proc = null;
     this.#pending = Buffer.alloc(0);
     this.#queue = [];
+    this.#reusableChunks = [];
+    this.#silenceChunk = null;
+    this.#isSilenceSource = false;
     this.#warmupUntilMs = 0;
   };
 
+  #stopTimer = (): void => {
+    if (!this.#emitTimer) return;
+    clearTimeout(this.#emitTimer);
+    this.#emitTimer = null;
+  };
+
   #resolveInputArgs = (): string[] => {
-    if (!this.source || this.source === "silence") {
-      return ["-f", "lavfi", "-i", `aevalsrc=0:d=3600:s=${this.sampleRate}`];
-    }
     if (this.source.startsWith("lavfi:")) {
       return ["-f", "lavfi", "-i", this.source.slice("lavfi:".length)];
     }
     return ["-i", this.source];
   };
 
-  #scheduleNext = (chunkSamples: number, chunkIntervalMs: number): void => {
-    if (!this.#proc) return;
-    const now = Date.now();
+  #scheduleNext = (chunkSamples: number): void => {
+    if (this.#stopped) return;
+    const now = performance.now();
     if (this.#nextEmitAtMs === 0) this.#nextEmitAtMs = now;
     const delayMs = Math.max(0, this.#nextEmitAtMs - now);
 
     this.#emitTimer = setTimeout(() => {
       this.#emitTimer = null;
-      if (this.#queue.length < LOW_WATERMARK_CHUNKS && Date.now() < this.#warmupUntilMs) {
-        this.#nextEmitAtMs = Date.now() + 10;
-        this.#scheduleNext(chunkSamples, chunkIntervalMs);
+      const currentTime = performance.now();
+      if (this.#queue.length < this.#targetQueuedChunks && currentTime < this.#warmupUntilMs) {
+        this.#nextEmitAtMs = currentTime + 5;
+        this.#scheduleNext(chunkSamples);
         return;
       }
       this.#flushOne(chunkSamples);
-      this.#nextEmitAtMs += chunkIntervalMs;
-      this.#scheduleNext(chunkSamples, chunkIntervalMs);
+      this.#nextEmitAtMs += this.#chunkIntervalMs;
+      if (currentTime - this.#nextEmitAtMs > this.#chunkIntervalMs) {
+        this.#nextEmitAtMs = currentTime + this.#chunkIntervalMs;
+      }
+      this.#scheduleNext(chunkSamples);
     }, delayMs);
+    this.#emitTimer.unref?.();
   };
 
   #flushOne = (chunkSamples: number): void => {
     let nextChunk = this.#queue.shift();
+    const reusable = nextChunk;
     if (!nextChunk) {
-      nextChunk = new Float32Array(chunkSamples);
-      this.underflowChunks += 1;
+      if (!this.#silenceChunk) {
+        this.#silenceChunk = new Float32Array(chunkSamples);
+        this.allocatedChunks += 1;
+      }
+      nextChunk = this.#silenceChunk;
+      if (!this.#isSilenceSource) this.underflowChunks += 1;
     }
     this.chunksEmitted += 1;
-    this.onChunk(nextChunk);
-    if (this.#proc?.stdout.isPaused() && this.#queue.length <= MAX_QUEUED_CHUNKS / 4) {
+    try {
+      this.onChunk(nextChunk);
+    } catch (err) {
+      this.onError?.(err instanceof Error ? err : new Error(String(err)));
+      this.stop();
+      return;
+    }
+    if (reusable && this.#reusableChunks.length < this.#maxQueuedChunks) {
+      this.#reusableChunks.push(reusable);
+    }
+    if (this.#proc?.stdout.isPaused() && this.#queue.length <= this.#targetQueuedChunks) {
       this.#proc.stdout.resume();
     }
   };
+
+  getStats = () => ({
+    queuedChunks: this.#queue.length,
+    targetQueuedChunks: this.#targetQueuedChunks,
+    maxQueuedChunks: this.#maxQueuedChunks,
+    bufferMs: Math.round(this.#queue.length * this.#chunkIntervalMs),
+    droppedChunks: this.droppedChunks,
+    underflowChunks: this.underflowChunks,
+    chunksEmitted: this.chunksEmitted,
+    bytesProduced: this.bytesProduced,
+    allocatedChunks: this.allocatedChunks,
+    reusedChunks: this.reusedChunks,
+  });
 }

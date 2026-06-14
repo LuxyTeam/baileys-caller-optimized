@@ -199,7 +199,7 @@ export class RelayRtcTransport {
         this.#relayInfoById.clear();
         for (const [id, info] of nextInfoById) {
             this.#relayInfoById.set(id, info);
-            void this.#ensureConnection(info);
+            void this.#ensureConnection(info).catch(this.#reportError);
         }
     };
     send = (packet, ip, port) => {
@@ -233,7 +233,7 @@ export class RelayRtcTransport {
             connection.packetBuffer = [];
             connection.bufferedBytes = 0;
             bufferPacket(connection, arrayBuffer);
-            void this.#restartIce(connection);
+            void this.#restartIce(connection).catch(this.#reportError);
             return packet.byteLength;
         }
         if (connection.state === "open" && connection.dataChannel?.readyState === "open") {
@@ -243,7 +243,7 @@ export class RelayRtcTransport {
             return packet.byteLength;
         }
         bufferPacket(connection, arrayBuffer);
-        void this.#ensureConnection(info);
+        void this.#ensureConnection(info).catch(this.#reportError);
         return packet.byteLength;
     };
     getStats = () => {
@@ -555,5 +555,8 @@ export class RelayRtcTransport {
     #loadWrtc = () => {
         this.#wrtcPromise ??= import("@roamhq/wrtc").then((module) => (module.default ?? module));
         return this.#wrtcPromise;
+    };
+    #reportError = (err) => {
+        this.config.onError?.(err instanceof Error ? err : new Error(String(err)));
     };
 }

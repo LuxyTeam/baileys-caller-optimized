@@ -4,16 +4,17 @@
  *
  * Usage: node --experimental-websocket scripts/fetch-wasm-resources.mjs
  */
-import { writeFileSync } from "fs";
+import { mkdirSync, writeFileSync } from "fs";
 import { resolve, dirname } from "path";
 import { fileURLToPath } from "url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const RESOURCES_DIR = resolve(__dirname, "../src/lib/wasm-resources");
+const RESOURCES_DIR = resolve(__dirname, "../assets/wasm");
 const DEBUGGER_URL = process.env.CALL_CHROME_DEBUGGER_JSON_URL || "http://127.0.0.1:9222/json/list";
 const WASM_ID = process.env.CALL_BROWSER_WASM_ID || "32180";
 
 async function main() {
+  mkdirSync(RESOURCES_DIR, { recursive: true });
   // Get page target
   const resp = await fetch(DEBUGGER_URL);
   const targets = await resp.json();
@@ -65,12 +66,14 @@ async function main() {
 
   console.log("Fetching worker-modules.js from:", resourceInfo.workerUrl);
   const workerResp = await fetch(resourceInfo.workerUrl);
+  if (!workerResp.ok) throw new Error(`Worker fetch failed: HTTP ${workerResp.status}`);
   const workerCode = await workerResp.text();
   writeFileSync(resolve(RESOURCES_DIR, "worker-modules.js"), workerCode);
   console.log(`  Written: worker-modules.js (${workerCode.length} bytes)`);
 
   console.log("Fetching whatsapp.wasm from:", resourceInfo.wasmUrl);
   const wasmResp = await fetch(resourceInfo.wasmUrl);
+  if (!wasmResp.ok) throw new Error(`WASM fetch failed: HTTP ${wasmResp.status}`);
   const wasmBuffer = Buffer.from(await wasmResp.arrayBuffer());
   writeFileSync(resolve(RESOURCES_DIR, "whatsapp.wasm"), wasmBuffer);
   console.log(`  Written: whatsapp.wasm (${wasmBuffer.length} bytes)`);

@@ -535,10 +535,10 @@ let WAWebVoipJsWorkerMessageHandler = {
 const getPreferredLoaderModuleNames = () => {
     return [
         typedWorkerData?.loaderModuleName,
-        "WAWebVoipWebWasmLoader",
         "WAWebVoipWebWasmLoader.worker",
         "WAWebVoipWebWasmLoader_ProdLab_internal.worker",
         "WAWebVoipWebWasmLoader_ProdLabvideo_internal.worker",
+        "WAWebVoipWebWasmLoader",
     ].filter((value, index, array) => !!value && array.indexOf(value) === index);
 };
 const resolveLoaderModule = () => {

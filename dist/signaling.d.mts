@@ -21,6 +21,7 @@ export type BaileysSocket = {
 };
 export type SignalingBridgeConfig = {
     sock: BaileysSocket;
+    onError?: (err: Error) => void;
 };
 export declare class SignalingBridge {
     #private;
@@ -31,6 +32,7 @@ export declare class SignalingBridge {
     sendSignaling: (peerJid: string, callId: string, xmlPayload: Uint8Array) => void;
     processIncomingCall: (node: any, voip: any, activeCallId: string) => void;
     processIncomingReceipt: (node: any, voip: any, activeCallId: string) => void;
+    dispose: () => void;
     requestTcToken: (jid: string) => Promise<Uint8Array | undefined>;
     ensureTcToken: (...jids: string[]) => Promise<Uint8Array | undefined>;
     discoverPeerDevices: (peerLidJid: string) => Promise<string[]>;
