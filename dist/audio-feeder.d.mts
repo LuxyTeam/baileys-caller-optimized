@@ -1,3 +1,4 @@
+import type { AudioQuality } from "./types.mjs";
 export declare class AudioFeeder {
     #private;
     private readonly sampleRate;
@@ -6,13 +7,14 @@ export declare class AudioFeeder {
     private readonly onChunk;
     private readonly source;
     private readonly onError?;
+    private readonly audioQuality;
     droppedChunks: number;
     underflowChunks: number;
     bytesProduced: number;
     chunksEmitted: number;
     allocatedChunks: number;
     reusedChunks: number;
-    constructor(sampleRate: number, channels: number, framesPerChunk: number, onChunk: (chunk: Float32Array) => void, source?: string, onError?: ((err: Error) => void) | undefined);
+    constructor(sampleRate: number, channels: number, framesPerChunk: number, onChunk: (chunk: Float32Array) => void, source?: string, onError?: ((err: Error) => void) | undefined, audioQuality?: AudioQuality);
     start: () => void;
     stop: () => void;
     getStats: () => {
@@ -26,5 +28,6 @@ export declare class AudioFeeder {
         bytesProduced: number;
         allocatedChunks: number;
         reusedChunks: number;
+        audioQuality: AudioQuality;
     };
 }

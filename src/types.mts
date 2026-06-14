@@ -12,12 +12,32 @@ export type AudioConfig = {
   framesPerChunk: number;
 };
 
+/** Processing applied to outbound file/lavfi audio before Opus encoding. */
+export type AudioQuality = "voice" | "raw";
+
+/** Minimum Baileys socket surface required by the VoIP signaling bridge. */
+export type BaileysSocketLike = {
+  authState: any;
+  signalRepository: any;
+  generateMessageTag: () => string;
+  query: (node: any) => Promise<any>;
+  sendNode: (node: any) => Promise<void>;
+  waitForMessage: (tag: string, timeoutMs: number) => Promise<any>;
+  getUSyncDevices: (jids: string[], ignoreZeroDevices: boolean, forceQuery: boolean) => Promise<any[]>;
+  presenceSubscribe: (jid: string) => Promise<void>;
+  ws: any;
+  ev: any;
+  end?: () => void;
+};
+
 /** Options for placing a call. */
 export type CallOptions = {
   /** Phone number, digits only (e.g. `"12345678901"`). */
   to: string;
   /** Audio source: file path to MP3/WAV, or `"silence"` for an empty uplink. */
   audioSource?: string;
+  /** `"voice"` improves speech clarity and level consistency; `"raw"` only resamples. */
+  audioQuality?: AudioQuality;
   /** Auto-hangup after N ms (default: 120000). */
   durationMs?: number;
 };
@@ -37,8 +57,13 @@ export type CallEvents = {
 
 /** Top-level SDK configuration. */
 export type VoipSdkConfig = {
-  /** Path to a Baileys multi-file auth state directory. */
-  authDir: string;
+  /** Path to a Baileys multi-file auth state directory. Not needed with `socket`. */
+  authDir?: string;
+  /**
+   * An already-connected Baileys socket. It remains owned by the caller and
+   * will not be closed by `VoipClient.disconnect()`.
+   */
+  socket?: BaileysSocketLike;
   /** Receives client-level errors that happen outside an active call. */
   onError?: (err: Error) => void;
   /** WASM worker count. Defaults to at most 4; lower values use less memory. */

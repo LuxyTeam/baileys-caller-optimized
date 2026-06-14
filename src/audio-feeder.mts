@@ -8,6 +8,7 @@
  */
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { performance } from "node:perf_hooks";
+import type { AudioQuality } from "./types.mjs";
 
 const TARGET_BUFFER_MS = 80;
 const MAX_BUFFER_MS = 200;
@@ -42,6 +43,7 @@ export class AudioFeeder {
     private readonly onChunk: (chunk: Float32Array) => void,
     private readonly source: string = "silence",
     private readonly onError?: (err: Error) => void,
+    private readonly audioQuality: AudioQuality = "voice",
   ) {}
 
   start = (): void => {
@@ -66,6 +68,7 @@ export class AudioFeeder {
     }
 
     const inputArgs = this.#resolveInputArgs();
+    const processingArgs = this.#resolveProcessingArgs();
 
     const proc = spawn("ffmpeg", [
       "-hide_banner",
@@ -73,8 +76,8 @@ export class AudioFeeder {
       "-nostdin",
       "-threads", "1",
       "-thread_queue_size", "64",
-      "-re",
       ...inputArgs,
+      ...processingArgs,
       "-f", "f32le",
       "-ac", String(this.channels),
       "-ar", String(this.sampleRate),
@@ -201,6 +204,19 @@ export class AudioFeeder {
     }
   };
 
+  #resolveProcessingArgs = (): string[] => {
+    if (this.audioQuality === "raw") return [];
+    const lowpassHz = Math.max(3000, Math.min(7600, Math.floor(this.sampleRate * 0.45)));
+    const filters = [
+      `aresample=${this.sampleRate}:filter_size=32:phase_shift=10:cutoff=0.97:dither_method=triangular_hp`,
+      "highpass=f=80",
+      `lowpass=f=${lowpassHz}`,
+      "acompressor=threshold=0.125:ratio=2.5:attack=5:release=80:makeup=1.5",
+      "alimiter=limit=0.95",
+    ];
+    return ["-af", filters.join(",")];
+  };
+
   getStats = () => ({
     queuedChunks: this.#queue.length,
     targetQueuedChunks: this.#targetQueuedChunks,
@@ -212,5 +228,6 @@ export class AudioFeeder {
     bytesProduced: this.bytesProduced,
     allocatedChunks: this.allocatedChunks,
     reusedChunks: this.reusedChunks,
+    audioQuality: this.audioQuality,
   });
 }

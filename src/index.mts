@@ -18,9 +18,23 @@ import { WasmEngine } from "./wasm-engine.mjs";
 import { RelayRtcTransport, type RelayListUpdatePayload } from "./relay-transport.mjs";
 import { SignalingBridge } from "./signaling.mjs";
 import { AudioFeeder } from "./audio-feeder.mjs";
-import { CallState, type AudioConfig, type VoipSdkConfig } from "./types.mjs";
+import {
+  CallState,
+  type AudioConfig,
+  type AudioQuality,
+  type BaileysSocketLike,
+  type CallOptions,
+  type VoipSdkConfig,
+} from "./types.mjs";
 
-export type { VoipSdkConfig, CallOptions, CallEvents, AudioConfig } from "./types.mjs";
+export type {
+  VoipSdkConfig,
+  CallOptions,
+  CallEvents,
+  AudioConfig,
+  AudioQuality,
+  BaileysSocketLike,
+} from "./types.mjs";
 export { CallState } from "./types.mjs";
 
 const SHA256_LEN = 32;
@@ -87,6 +101,8 @@ export class ActiveCall extends EventEmitter {
 
   /** @internal mirrors the source path for the audio feeder */
   _audioSource: string = "silence";
+  /** @internal outbound audio processing profile */
+  _audioQuality: AudioQuality = "voice";
 
   constructor(
     public readonly callId: string,
@@ -174,6 +190,8 @@ export class VoipClient {
   #sock: any = null;
   #activeCall: ActiveCall | null = null;
   #baileys: any = null;
+  #ownsSocket = false;
+  readonly #socketListenerDisposers: Array<() => void> = [];
 
   // Capture state populated when WASM negotiates audio params
   #capturePtr = 0;
@@ -200,10 +218,25 @@ export class VoipClient {
 
   #connectInternal = async (): Promise<void> => {
     this.#baileys = await loadBaileys();
+    if (this.#config.socket) {
+      this.#validateExternalSocket(this.#config.socket);
+      this.#sock = this.#config.socket;
+      this.#ownsSocket = false;
+    } else {
+      await this.#createAndConnectSocket();
+    }
+
+    await this.#initializeVoip();
+  };
+
+  #createAndConnectSocket = async (): Promise<void> => {
     const { useMultiFileAuthState, default: makeWASocket, DisconnectReason } = this.#baileys;
     const makeSocket: (opts: any) => any =
       makeWASocket ?? this.#baileys.makeWASocket ?? this.#baileys;
 
+    if (!this.#config.authDir) {
+      throw new Error("Provide either authDir or an already-connected Baileys socket.");
+    }
     const authDir = resolve(this.#config.authDir);
     const { state, saveCreds } = await useMultiFileAuthState(authDir);
 
@@ -245,6 +278,7 @@ export class VoipClient {
         try { this.#sock?.end?.(); } catch {}
         const socket = createSocket();
         this.#sock = socket;
+        this.#ownsSocket = true;
         socket.ev.on("creds.update", saveCreds);
 
         socket.ev.on("connection.update", (update: any) => {
@@ -287,7 +321,9 @@ export class VoipClient {
 
       connectSocket();
     });
+  };
 
+  #initializeVoip = async (): Promise<void> => {
     this.#signaling = new SignalingBridge({
       sock: this.#sock,
       onError: (err) => this.#handleError(err),
@@ -327,19 +363,49 @@ export class VoipClient {
     await this.#engine.waitForVoipStackReady();
     try { this.#engine.updateNetworkMedium(2, 0); } catch {}
 
-    this.#sock.ws.on("CB:call", (node: any) => {
+    this.#addSocketListener("CB:call", (node: any) => {
       this.#signaling!.processIncomingCall(node, this.#engine!, this.#activeCall?.callId ?? "");
     });
-    this.#sock.ws.on("CB:receipt", (node: any) => {
+    this.#addSocketListener("CB:receipt", (node: any) => {
       if (!isCallReceiptNode(node)) return;
       this.#signaling!.processIncomingReceipt(node, this.#engine!, this.#activeCall?.callId ?? "");
+    });
+  };
+
+  #validateExternalSocket = (socket: BaileysSocketLike): void => {
+    const socketRecord = socket as unknown as Record<string, unknown>;
+    const missing = [
+      "authState",
+      "signalRepository",
+      "generateMessageTag",
+      "query",
+      "sendNode",
+      "waitForMessage",
+      "getUSyncDevices",
+      "presenceSubscribe",
+      "ws",
+    ].filter((key) => socketRecord[key] == null);
+    if (missing.length) {
+      throw new Error(`Invalid Baileys socket; missing: ${missing.join(", ")}`);
+    }
+    if (!socket.authState?.creds?.me?.id) {
+      throw new Error("The provided Baileys socket is not authenticated or connected.");
+    }
+  };
+
+  #addSocketListener = (event: string, listener: (node: any) => void): void => {
+    this.#sock.ws.on(event, listener);
+    this.#socketListenerDisposers.push(() => {
+      const ws = this.#sock?.ws;
+      if (typeof ws?.off === "function") ws.off(event, listener);
+      else if (typeof ws?.removeListener === "function") ws.removeListener(event, listener);
     });
   };
 
   /** Place an outbound voice call. */
   call = async (
     phoneNumber: string,
-    opts: { audioSource?: string; durationMs?: number } = {},
+    opts: Omit<CallOptions, "to"> = {},
   ): Promise<ActiveCall> => {
     if (!this.#engine || !this.#signaling) throw new Error("Not connected. Call connect() first.");
     if (this.#activeCall) throw new Error("A call is already active.");
@@ -352,6 +418,10 @@ export class VoipClient {
       throw new Error("durationMs must be a finite number greater than or equal to zero.");
     }
     const audioSource = opts.audioSource ?? "silence";
+    const audioQuality = opts.audioQuality ?? "voice";
+    if (audioQuality !== "voice" && audioQuality !== "raw") {
+      throw new Error('audioQuality must be either "voice" or "raw".');
+    }
 
     const peerLid = await this.#signaling.resolveLid(targetPnJid);
     if (!peerLid) throw new Error(`Could not resolve LID for ${targetPnJid}`);
@@ -374,6 +444,7 @@ export class VoipClient {
 
     const call = new ActiveCall(callId, this.#engine, durationMs);
     call._audioSource = audioSource;
+    call._audioQuality = audioQuality;
     this.#activeCall = call;
     call.once("ended", () => {
       if (this.#activeCall === call) this.#activeCall = null;
@@ -408,7 +479,10 @@ export class VoipClient {
     this.#relay?.closeAll();
     this.#signaling?.dispose();
     this.#engine?.destroy();
-    this.#sock?.end?.();
+    for (const dispose of this.#socketListenerDisposers.splice(0)) dispose();
+    const ownedSocket = this.#ownsSocket ? this.#sock : null;
+    this.#ownsSocket = false;
+    ownedSocket?.end?.();
     this.#engine = null;
     this.#relay = null;
     this.#signaling = null;
@@ -463,6 +537,7 @@ export class VoipClient {
     if (!this.#engine || !this.#capturePtr) return;
     this.#feeder?.stop();
     const audioSource = this.#activeCall?._audioSource ?? "silence";
+    const audioQuality = this.#activeCall?._audioQuality ?? "voice";
     this.#feeder = new AudioFeeder(
       this.#captureSampleRate,
       this.#captureChannels,
@@ -472,6 +547,7 @@ export class VoipClient {
       },
       audioSource,
       (err) => this.#handleError(err),
+      audioQuality,
     );
     this.#feeder.start();
   };

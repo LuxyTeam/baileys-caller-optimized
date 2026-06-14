@@ -17,6 +17,10 @@ This optimized edition is maintained by **Starsky**.
   memory usage by approximately 63%.
 - Reworked outbound audio streaming with bounded buffering, reusable PCM
   chunks, monotonic timing, and drift correction.
+- Added a speech-focused DSP profile with high-quality resampling, voice-band
+  filtering, compression, and peak limiting before Opus encoding.
+- Added support for reusing an already-connected Baileys socket without
+  scanning another QR code or closing the shared connection.
 - Improved inbound audio polling and avoided unnecessary PCM copies when no
   audio listener is attached.
 - Added reliable call cleanup, sequential-call support, timeout handling,
@@ -99,6 +103,42 @@ console.log(await call.waitForEnd());
 client.disconnect();
 ```
 
+### Reuse an Existing Baileys Connection
+
+When your application already has an authenticated and connected Baileys
+socket, pass that same socket to `VoipClient`. No additional QR scan or second
+WhatsApp connection is created:
+
+```ts
+import makeWASocket from "@whiskeysockets/baileys";
+import { VoipClient } from "baileys-caller";
+
+const sock = makeWASocket({
+  auth: existingAuthState,
+  // Your existing Baileys options...
+});
+
+// Wait for your normal Baileys connection.update event to report "open".
+const voip = new VoipClient({
+  socket: sock,
+  pthreadPoolSize: 4,
+});
+
+await voip.connect(); // Initializes only the VoIP stack.
+
+const call = await voip.call("12345678901", {
+  audioSource: "./hello.wav",
+  audioQuality: "voice",
+});
+
+await call.waitForEnd();
+voip.disconnect(); // The shared `sock` remains connected.
+```
+
+The supplied socket must already be authenticated and connected. It must expose
+the standard Baileys socket APIs, auth state, signal repository, and WebSocket
+event emitter used by the VoIP signaling bridge.
+
 Run the bundled example:
 
 ```bash
@@ -112,9 +152,11 @@ npx tsx examples/call.mts ./auth 12345678901 ./hello.mp3
 | Option | Type | Description |
 | --- | --- | --- |
 | `authDir` | `string` | Baileys multi-file auth directory. Treat it as a credential. |
+| `socket` | `Baileys socket?` | Existing authenticated and connected socket. Reused without taking ownership. |
 | `pthreadPoolSize` | `number?` | WASM worker count. Defaults to at most 4. |
 | `onError` | `(err: Error) => void` | Errors that happen outside an active call. |
 
+Provide either `authDir` or `socket`. When both are present, `socket` is used.
 Only one `VoipClient`/WASM engine can be active in a Node.js process at once.
 
 ### `client.connect(): Promise<void>`
@@ -127,6 +169,7 @@ prints a QR code for WhatsApp Linked Devices.
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `audioSource` | `string` | `"silence"` | File path, `"silence"`, or a `lavfi:` expression. |
+| `audioQuality` | `"voice" \| "raw"` | `"voice"` | Speech enhancement or resampling-only processing. |
 | `durationMs` | `number` | `120000` | Automatic hang-up timeout. Use `0` to disable it. |
 
 Only one call can be active at a time. After it ends, the same connected client
@@ -161,8 +204,9 @@ Interpretation:
 
 ### `client.disconnect(): void`
 
-Ends the active call, stops audio, closes relay connections and the WhatsApp
-socket, terminates workers, and releases the WASM runtime.
+Ends the active call, stops audio, closes relay connections, terminates workers,
+and releases the WASM runtime. An internally-created WhatsApp socket is closed;
+a socket supplied through `socket` remains connected.
 
 ### `ActiveCall`
 
@@ -192,13 +236,16 @@ Methods and properties:
 Outbound file audio:
 
 1. `ffmpeg` decodes and resamples the source to the format requested by WASM.
-   Input is read at native real-time speed to avoid burst decoding.
-2. A bounded queue keeps roughly 80 ms ready and never grows beyond about
+   Backpressure pauses decoding whenever the bounded queue is full.
+2. The default `"voice"` profile applies high-quality resampling, an 80 Hz
+   high-pass filter, a negotiated-rate low-pass filter, gentle compression,
+   and peak limiting. Use `"raw"` for music or already-mastered audio.
+3. A bounded queue keeps roughly 80 ms ready and never grows beyond about
    200 ms.
-3. Reusable `Float32Array` buffers reduce per-frame allocations and garbage
+4. Reusable `Float32Array` buffers reduce per-frame allocations and garbage
    collection.
-4. A monotonic clock sends frames at the exact negotiated frame cadence.
-5. WASM encodes Opus and sends RTP/SRTP through the selected relay.
+5. A monotonic clock sends frames at the exact negotiated frame cadence.
+6. WASM encodes Opus and sends RTP/SRTP through the selected relay.
 
 Inbound audio:
 

@@ -7,20 +7,9 @@
  *
  * @author ShellTear
  */
-export type BaileysSocket = {
-    authState: any;
-    signalRepository: any;
-    generateMessageTag: () => string;
-    query: (node: any) => Promise<any>;
-    sendNode: (node: any) => Promise<void>;
-    waitForMessage: (tag: string, timeoutMs: number) => Promise<any>;
-    getUSyncDevices: (jids: string[], ignoreZeroDevices: boolean, forceQuery: boolean) => Promise<any[]>;
-    presenceSubscribe: (jid: string) => Promise<void>;
-    ws: any;
-    ev: any;
-};
+import type { BaileysSocketLike } from "./types.mjs";
 export type SignalingBridgeConfig = {
-    sock: BaileysSocket;
+    sock: BaileysSocketLike;
     onError?: (err: Error) => void;
 };
 export declare class SignalingBridge {

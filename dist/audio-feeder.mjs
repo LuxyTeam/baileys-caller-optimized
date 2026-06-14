@@ -18,6 +18,7 @@ export class AudioFeeder {
     onChunk;
     source;
     onError;
+    audioQuality;
     #proc = null;
     #pending = Buffer.alloc(0);
     #queue = [];
@@ -37,13 +38,14 @@ export class AudioFeeder {
     chunksEmitted = 0;
     allocatedChunks = 0;
     reusedChunks = 0;
-    constructor(sampleRate, channels, framesPerChunk, onChunk, source = "silence", onError) {
+    constructor(sampleRate, channels, framesPerChunk, onChunk, source = "silence", onError, audioQuality = "voice") {
         this.sampleRate = sampleRate;
         this.channels = channels;
         this.framesPerChunk = framesPerChunk;
         this.onChunk = onChunk;
         this.source = source;
         this.onError = onError;
+        this.audioQuality = audioQuality;
     }
     start = () => {
         if (!this.#stopped)
@@ -62,14 +64,15 @@ export class AudioFeeder {
             return;
         }
         const inputArgs = this.#resolveInputArgs();
+        const processingArgs = this.#resolveProcessingArgs();
         const proc = spawn("ffmpeg", [
             "-hide_banner",
             "-loglevel", "error",
             "-nostdin",
             "-threads", "1",
             "-thread_queue_size", "64",
-            "-re",
             ...inputArgs,
+            ...processingArgs,
             "-f", "f32le",
             "-ac", String(this.channels),
             "-ar", String(this.sampleRate),
@@ -196,6 +199,19 @@ export class AudioFeeder {
             this.#proc.stdout.resume();
         }
     };
+    #resolveProcessingArgs = () => {
+        if (this.audioQuality === "raw")
+            return [];
+        const lowpassHz = Math.max(3000, Math.min(7600, Math.floor(this.sampleRate * 0.45)));
+        const filters = [
+            `aresample=${this.sampleRate}:filter_size=32:phase_shift=10:cutoff=0.97:dither_method=triangular_hp`,
+            "highpass=f=80",
+            `lowpass=f=${lowpassHz}`,
+            "acompressor=threshold=0.125:ratio=2.5:attack=5:release=80:makeup=1.5",
+            "alimiter=limit=0.95",
+        ];
+        return ["-af", filters.join(",")];
+    };
     getStats = () => ({
         queuedChunks: this.#queue.length,
         targetQueuedChunks: this.#targetQueuedChunks,
@@ -207,5 +223,6 @@ export class AudioFeeder {
         bytesProduced: this.bytesProduced,
         allocatedChunks: this.allocatedChunks,
         reusedChunks: this.reusedChunks,
+        audioQuality: this.audioQuality,
     });
 }

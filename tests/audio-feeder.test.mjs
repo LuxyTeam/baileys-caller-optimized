@@ -65,4 +65,24 @@ test("keeps the outbound buffer bounded and emits at frame cadence", { timeout: 
   const intervals = emittedAt.slice(1).map((value, index) => value - emittedAt[index]);
   const averageInterval = intervals.reduce((sum, value) => sum + value, 0) / intervals.length;
   assert.ok(averageInterval >= 15 && averageInterval <= 25, `average=${averageInterval}`);
+  assert.equal(stats.audioQuality, "voice");
+});
+
+test("supports raw audio without the voice enhancement profile", { timeout: 5_000 }, async () => {
+  const feeder = new AudioFeeder(
+    16_000,
+    1,
+    320,
+    () => {},
+    "lavfi:sine=frequency=440:sample_rate=16000",
+    undefined,
+    "raw",
+  );
+  feeder.start();
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  const stats = feeder.getStats();
+  feeder.stop();
+
+  assert.equal(stats.audioQuality, "raw");
+  assert.ok(stats.chunksEmitted > 0);
 });
